@@ -15,3 +15,5 @@ is unwise. Additionally, heavy integration allows me to support fixed size array
 
 Finally, it allows me to reduce dependencies, by dropping the likes of [Optim.jl](https://github.com/JuliaNLSolvers/Optim.jl) in favor of the lighter (but much less featureful) QuasiNewtonMethods.jl.
 
+All that said, the contributors to DynamicHMC, as well as those developing the theory of HMC (eg, Betancourt, et al) all deserve much more credit than I.
+

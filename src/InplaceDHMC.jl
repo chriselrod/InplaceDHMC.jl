@@ -11,17 +11,18 @@ export
     InitialStepsizeSearch, DualAveraging, FindLocalOptimum,
     TuningNUTS, mcmc_with_warmup, default_warmup_stages, fixed_stepsize_warmup_stages
 
-using ArgCheck: @argcheck
+# using ArgCheck: @argcheck
 using DocStringExtensions: FIELDS, FUNCTIONNAME, SIGNATURES, TYPEDEF
 using LinearAlgebra
 using LinearAlgebra: checksquare, Diagonal, Symmetric
-using LogDensityProblems: capabilities, LogDensityOrder, dimension, logdensity_and_gradient
+# using LogDensityProblems: capabilities, LogDensityOrder, dimension, logdensity_and_gradient
 # import NLSolversBase, Optim # optimization step in mcmc
 using Parameters: @unpack
 using Random: AbstractRNG, randn, Random, randexp
 using Statistics: cov, mean, median, middle, quantile, var
 
-using QuasiNewtonMethods
+using VectorizationBase, LoopVectorization, StackPointers, PaddedMatrices, QuasiNewtonMethods
+using ProbabilityModels: AbstractProbabilityModel
 
 # copy from StatsFuns.jl
 function logaddexp(x, y)
@@ -1436,20 +1437,22 @@ function Base.show(io::IO, tuning::TuningNUTS{M}) where {M}
     print(io, "Stepsize and metric tuner, $(N) samples, $(M) metric, regularization $(λ)")
 end
 
+Base.length(t::TuningNUTS) = t.N
+
 """
 $(SIGNATURES)
 Form a matrix from positions (`q`), with each column containing a position.
 """
 position_matrix(chain) = reduce(hcat, chain)
 
-"""
-$(SIGNATURES)
-Estimate the inverse metric from the chain.
-In most cases, this should be regularized, see [`regularize_M⁻¹`](@ref).
-"""
-sample_M⁻¹(::Type{Diagonal}, chain) = Diagonal(vec(var(position_matrix(chain); dims = 2)))
+# """
+# $(SIGNATURES)
+# Estimate the inverse metric from the chain.
+# In most cases, this should be regularized, see [`regularize_M⁻¹`](@ref).
+# """
+# sample_M⁻¹(::Type{Diagonal}, chain) = Diagonal(vec(var(position_matrix(chain); dims = 2)))
 
-sample_M⁻¹(::Type{Symmetric}, chain) = Symmetric(cov(position_matrix(chain); dims = 2))
+# sample_M⁻¹(::Type{Symmetric}, chain) = Symmetric(cov(position_matrix(chain); dims = 2))
 
 
 function warmup(
@@ -1600,11 +1603,11 @@ function warmup(
     DynamicHMC.WarmupState(Q, κ, DynamicHMC.final_ϵ(ϵ_state)))
 end
 
-function mcmc(sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
+function mcmc(sampling_logdensity::SamplingLogDensity{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
     chain = Matrix{eltype(Q.q)}(undef, length(Q.q), N)
     mcmc!(chain, sampling_logdensity, N, warmup_state, sp)
 end
-function mcmc!(chain::AbstractMatrix, sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
+function mcmc!(chain::AbstractMatrix, sampling_logdensity::SamplingLogDensity{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
     @unpack rng, ℓ, sampler_options, reporter = sampling_logdensity
     @unpack Q, κ, ϵ = warmup_state
 
@@ -1648,16 +1651,16 @@ This is the suggested tuner of most applications.
 Use `nothing` for `local_optimization` or `stepsize_adaptation` to skip the corresponding
 step.
 """
-@generated function default_warmup_stages(;
+function default_warmup_stages(;
                                local_optimization = FindLocalOptimum(),
                                stepsize_search = InitialStepsizeSearch(),
                                M::Type{<:Union{Diagonal,Symmetric}} = Diagonal,
                                stepsize_adaptation = DualAveraging(),
-                               init_steps = 75, middle_steps = 25, doubling_stages = 5,
-                               terminating_steps = 50)
+                               init_steps = 75, middle_steps = 25, doubling_stages::Val{DS} = Val(5),
+                               terminating_steps = 50) where {DS}
     (local_optimization, stepsize_search,
      TuningNUTS{Nothing}(init_steps, stepsize_adaptation),
-     _doubling_warmup_stages(M, stepsize_adaptation, middle_steps, Val(doubling_stages))...,
+     _doubling_warmup_stages(M, stepsize_adaptation, middle_steps, Val(DS))...,
      TuningNUTS{Nothing}(terminating_steps, stepsize_adaptation))
 end
 
@@ -1673,9 +1676,9 @@ stepsize tuning.
 function fixed_stepsize_warmup_stages(;
                                       local_optimization = FindLocalOptimum(),
                                       M::Type{<:Union{Diagonal,Symmetric}} = Diagonal,
-                                      middle_steps = 25, doubling_stages = 5)
+                                      middle_steps = 25, doubling_stages::Val{DS} = 5) where {DS}
     (local_optimization,
-     _doubling_warmup_stages(M, FixedStepsize(), middle_steps, Val(doubling_stages))...)
+     _doubling_warmup_stages(M, FixedStepsize(), middle_steps, Val(DS))...)
 end
 
 """
@@ -1782,6 +1785,45 @@ function mcmc_with_warmup(rng, ℓ, N; initialization = (),
         mcmc_keep_warmup(rng, ℓ, N; initialization = initialization,
                          warmup_stages = warmup_stages, algorithm = algorithm,
                          reporter = reporter)
+    @unpack κ, ϵ = final_warmup_state
+    (inference..., κ = κ, ϵ = ϵ)
+end
+
+function mcmc_with_warmup!(rng::AbstractRNG, sptr::StackPointer, ℓ::AbstractProbabilityModel, sample::AbstractMatrix, N = size(sample,2); initialization = (),
+    warmup_stages = default_warmup_stages(),
+    algorithm = NUTS(), reporter = default_reporter())
+@unpack final_warmup_state, inference =
+mcmc_keep_warmup(rng, ℓ, N; initialization = initialization,
+   warmup_stages = warmup_stages, algorithm = algorithm,
+   reporter = reporter)
+@unpack κ, ϵ = final_warmup_state
+(inference..., κ = κ, ϵ = ϵ)
+end
+
+
+function threaded_mcmc(
+    ℓ::AbstractProbabilityModel{D}, N; initialization = (),
+    warmup_stages = default_warmup_stages(),
+    algorithm = NUTS(), reporter = default_reporter()
+) where {D}
+    nthreads = ProbabilityModels.NTHREADS[]
+    sptr = ProbabilityModels.STACK_POINTER_REF[]
+    LSS = ProbabilityModels.LOCAL_STACK_SIZE[]
+    nwarmup = sum(length,warmup_stages)
+    NS = max(N,nwarmup)
+    L = VectorizationBase.align(D, Float64)
+    samples = DynamicPaddedArray{Float64}(undef, (D, NS, nthreads), L)
+    sample_ptr = pointer(samples)
+    Threads.@threads for t in 1:nthreads
+        sample = DynamicPtrMatrix{Float64}(sample_ptr, (D, NS), L)
+        rng =  ProbabilityModels.GLOBAL_PCGs[t]
+        mcmc_with_warmup!(rng, sptr, sample, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
+        sptr += LSS
+        sample_ptr += sizeof(Float64)*NS*L
+    end
+    samples
+    @unpack final_warmup_state, inference = mcmc_keep_warmup(
+        rng, ℓ, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
     @unpack κ, ϵ = final_warmup_state
     (inference..., κ = κ, ϵ = ϵ)
 end
