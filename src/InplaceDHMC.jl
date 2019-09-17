@@ -14,7 +14,7 @@ export
 # using ArgCheck: @argcheck
 using DocStringExtensions: FIELDS, FUNCTIONNAME, SIGNATURES, TYPEDEF
 using LinearAlgebra
-using LinearAlgebra: checksquare, Diagonal, Symmetric
+using LinearAlgebra: Diagonal, Symmetric
 # using LogDensityProblems: capabilities, LogDensityOrder, dimension, logdensity_and_gradient
 # import NLSolversBase, Optim # optimization step in mcmc
 using Parameters: @unpack
@@ -381,7 +381,7 @@ function GaussianKineticEnergy(sptr::StackPointer, ::Val{N}, m⁻¹::T = 1.0) wh
     GaussianKineticEnergy(sptr, Diagonal(M⁻¹))
 end
 
-@generated function DynamicHMC.GaussianKineticEnergy(sp::StackPointer, sample::AbstractMatrix{T}, λ::T, ::Val{D}) where {D,T}
+@generated function GaussianKineticEnergy(sp::StackPointer, sample::AbstractMatrix{T}, λ::T, ::Val{D}) where {D,T}
     W, Wshift = VectorizationBase.pick_vector_width_shift(M, T)
     Wm1 = W-1
     M = (D + Wm1) & ~Wm1
@@ -435,7 +435,7 @@ end
     if blocked_rem > 0
         push!(q.args, regularized_cov_block_quote(W, T, blocked_rem, M, need_to_mask, VectorizationBase.mask(T,Wrem)))        
     end
-    push!(q.args, :(sp + $(2AL), DynamicHMC.GaussianKineticEnergy(Diagonal(regs²), Diagonal(invs))))
+    push!(q.args, :(sp + $(2AL), GaussianKineticEnergy(Diagonal(regs²), Diagonal(invs))))
     q
 end
 
@@ -634,7 +634,7 @@ function leapfrog(sp::StackPointer,
     end
     # Variables that escape:
     # p′, Q′ (q′, ∇ℓq)
-    sp, Q′ = DynamicHMC.evaluate_ℓ(sp + 2B, H.ℓ, q′)
+    sp, Q′ = evaluate_ℓ(sp + 2B, H.ℓ, q′)
     ∇ℓq′ = Q′.∇ℓq
     p′ = pₘ # PtrVector{P,T,L,L}(sptr + 3bytes)
     @fastmath @inbounds @simd for l ∈ 1:L
@@ -1341,9 +1341,19 @@ Create an initial warmup state from a random position.
 # Keyword arguments
 $(DOC_INITIAL_WARMUP_ARGS)
 """
-function initialize_warmup_state(rng, ℓ; q = random_position(rng, dimension(ℓ)),
-                                 κ = GaussianKineticEnergy(dimension(ℓ)), ϵ = nothing)
-    WarmupState(evaluate_ℓ(ℓ, q), κ, ϵ)
+function initialize_warmup_state(rng, sptr, ℓ; q = nothing, κ = nothing, ϵ = nothing)
+    if q ≡ nothing
+        sptr, q′ = random_position(rng, sptr, dimension(ℓ))
+    else
+        q′ = q
+    end
+    if κ ≡ nothing
+        sptr, κ′ = GaussianKineticEnergy(sptr, dimension(ℓ))
+    else
+        κ′ = κ
+    end
+    sptr, eℓ = evaluate_ℓ(ℓ, q′)
+    sptr, WarmupState(eℓ, κ′, ϵ)
 end
 
 """
@@ -1366,28 +1376,33 @@ Base.@kwdef struct FindLocalOptimum{T}
     iterations::Int = 50
     # FIXME allow custom algorithm, tolerance, etc
 end
-
-function warmup(sampling_logdensity, local_optimization::FindLocalOptimum, warmup_state)
+@noinline ThrowOptimizationError(str) = throw(str)
+function warmup!(
+    sp::StackPointer, sample::AbstractMatrix, sampling_logdensity::SamplingLogDensity{D}, local_optimization::FindLocalOptimum, warmup_state
+) where {D}
     @unpack ℓ, reporter = sampling_logdensity
     @unpack magnitude_penalty, iterations = local_optimization
     @unpack Q, κ, ϵ = warmup_state
     @unpack q = Q
     report(reporter, "finding initial optimum")
-    fg! = function(F, G, q)
-        ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
-        if G ≠ nothing
-            @. G = -∇ℓq - q * magnitude_penalty
-        end
-        -ℓq - (0.5 * magnitude_penalty * sum(abs2, q))
-    end
-    objective = NLSolversBase.OnceDifferentiable(NLSolversBase.only_fg!(fg!), q)
-    opt = Optim.optimize(objective, q, Optim.LBFGS(),
-                         Optim.Options(; iterations = iterations))
-    q = Optim.minimizer(opt)
-    nothing, WarmupState(evaluate_ℓ(ℓ, q), κ, ϵ)
+    sptr, ℓq = proptimize!(sp, sampling_logdensity.ℓ, q, magnitude_penalty, iterations)
+    isfinite(ℓq) || ThrowOptimizationError("Optimization failed to converge, returning $ℓq.")
+    # fg! = function(F, G, q)
+        # ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
+        # if G ≠ nothing
+            # @. G = -∇ℓq - q * magnitude_penalty
+        # end
+        # -ℓq - (0.5 * magnitude_penalty * sum(abs2, q))
+    # end
+    # objective = NLSolversBase.OnceDifferentiable(NLSolversBase.only_fg!(fg!), q)
+    # opt = Optim.optimize(objective, q, Optim.LBFGS(),
+                         # Optim.Options(; iterations = iterations))
+    sp, q = PtrVector{D,Float64}(sp)
+    ∇ℓq = PtrVector{D,Float64}(pointer(sp,Float64))
+    sptr, (nothing, WarmupState(EvaluatedLogDensity(q, ℓq, ∇ℓq), κ, ϵ))
 end
 
-function warmup(sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
+function warmup!(sp::StackPointer, sample::AbstractMatrix, sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
     @unpack rng, ℓ, reporter = sampling_logdensity
     @unpack Q, κ, ϵ = warmup_state
     # @argcheck ϵ ≡ nothing "stepsize ϵ manually specified, won't perform initial search"
@@ -1455,10 +1470,10 @@ position_matrix(chain) = reduce(hcat, chain)
 # sample_M⁻¹(::Type{Symmetric}, chain) = Symmetric(cov(position_matrix(chain); dims = 2))
 
 
-function warmup(
-    sp::StackPointer,
-    sampling_logdensity::DynamicHMC.SamplingLogDensity{<:VectorizedRNG.AbstractPCG, <:ProbabilityModels.AbstractProbabilityModel{D}},
-    tuning::DynamicHMC.TuningNUTS{Diagonal},
+function warmup!(
+    sp::StackPointer, sample,
+    sampling_logdensity::SamplingLogDensity{D, <:VectorizedRNG.AbstractPCG},
+    tuning::TuningNUTS{Diagonal},
     warmup_state
 ) where {D}
     @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
@@ -1467,26 +1482,26 @@ function warmup(
     L = VectorizationBase.align(D, T)
     chain = Matrix{typeof(Q.q)}(undef, L, N)
     chain_ptr = pointer(chain)
-    tree_statistics = Vector{DynamicHMC.TreeStatisticsNUTS}(undef, N)
+    tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
     H = Hamiltonian(κ, ℓ)
     ϵ_state = DynamicHMC.initial_adaptation_state(stepsize_adaptation, ϵ)
     ϵs = Vector{Float64}(undef, N)
-    mcmc_reporter = DynamicHMC.make_mcmc_reporter(reporter, N; tuning = "stepsize and Diagonal{T,PtrVector{}} metric")
+    mcmc_reporter = make_mcmc_reporter(reporter, N; tuning = "stepsize and Diagonal{T,PtrVector{}} metric")
     for i in 1:N
         ϵ = current_ϵ(ϵ_state)
         ϵs[i] = ϵ
-        Q, stats = DynamicHMC.sample_tree(rng, algorithm, H, Q, ϵ)
+        Q, stats = sample_tree(rng, algorithm, H, Q, ϵ)
         copyto!( PtrVector{D,T}( chain_ptr ), Q.q ); chain_ptr += L*sizeof(T)
         tree_statistics[i] = stats
-        ϵ_state = DynamicHMC.adapt_stepsize(stepsize_adaptation, ϵ_state, stats.acceptance_rate)
-        DynamicHMC.report(mcmc_reporter, i; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
+        ϵ_state = adapt_stepsize(stepsize_adaptation, ϵ_state, stats.acceptance_rate)
+        report(mcmc_reporter, i; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
     end
     # κ = GaussianKineticEnergy(regularize_M⁻¹(sample_M⁻¹(M, chain), λ))
-    sp, κ = DynamicHMC.GaussianKineticEnergy(sp, chain, λ, Val{D}())
-    DynamicHMC.report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
+    sp, κ = GaussianKineticEnergy(sp, chain, λ, Val{D}())
+    report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
     
     ((chain = chain, tree_statistics = tree_statistics, ϵs = ϵs),
-    DynamicHMC.WarmupState(Q, κ, DynamicHMC.final_ϵ(ϵ_state)))
+    WarmupState(Q, κ, final_ϵ(ϵ_state)))
 end
 
 function mcmc(sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
@@ -1569,39 +1584,6 @@ end
     # end
     # (chain = chain, tree_statistics = tree_statistics)
 # end
-function warmup(
-    sp::StackPointer,
-    sampling_logdensity::DynamicHMC.SamplingLogDensity{<:VectorizedRNG.AbstractPCG, <:ProbabilityModels.AbstractProbabilityModel{D}},
-    tuning::DynamicHMC.TuningNUTS{Diagonal},
-    warmup_state
-) where {D}
-    @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
-    @unpack Q, κ, ϵ = warmup_state
-    @unpack N, stepsize_adaptation, λ = tuning
-    L = VectorizationBase.align(D, T)
-    chain = Matrix{typeof(Q.q)}(undef, L, N)
-    chain_ptr = pointer(chain)
-    tree_statistics = Vector{DynamicHMC.TreeStatisticsNUTS}(undef, N)
-    H = Hamiltonian(κ, ℓ)
-    ϵ_state = DynamicHMC.initial_adaptation_state(stepsize_adaptation, ϵ)
-    ϵs = Vector{Float64}(undef, N)
-    mcmc_reporter = DynamicHMC.make_mcmc_reporter(reporter, N; tuning = "stepsize and Diagonal{T,PtrVector{}} metric")
-    for i in 1:N
-        ϵ = current_ϵ(ϵ_state)
-        ϵs[i] = ϵ
-        Q, stats = DynamicHMC.sample_tree(rng, algorithm, H, Q, ϵ)
-        copyto!( PtrVector{D,T}( chain_ptr ), Q.q ); chain_ptr += L*sizeof(T)
-        tree_statistics[i] = stats
-        ϵ_state = DynamicHMC.adapt_stepsize(stepsize_adaptation, ϵ_state, stats.acceptance_rate)
-        DynamicHMC.report(mcmc_reporter, i; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
-    end
-    # κ = GaussianKineticEnergy(regularize_M⁻¹(sample_M⁻¹(M, chain), λ))
-    sp, κ = DynamicHMC.GaussianKineticEnergy(sp, chain, λ, Val{D}())
-    DynamicHMC.report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
-    
-    ((chain = chain, tree_statistics = tree_statistics, ϵs = ϵs),
-    DynamicHMC.WarmupState(Q, κ, DynamicHMC.final_ϵ(ϵ_state)))
-end
 
 function mcmc(sampling_logdensity::SamplingLogDensity{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
     chain = Matrix{eltype(Q.q)}(undef, length(Q.q), N)
@@ -1687,10 +1669,10 @@ Helper function for implementing warmup.
 !!! note
     Changes may imply documentation updates in [`mcmc_keep_warmup`](@ref).
 """
-function _warmup(sampling_logdensity, stages, initial_warmup_state)
+function _warmup!(sptr, sample, sampling_logdensity, stages, initial_warmup_state)
     foldl(stages; init = ((), initial_warmup_state)) do acc, stage
         stages_and_results, warmup_state = acc
-        results, warmup_state′ = warmup(sampling_logdensity, stage, warmup_state)
+        results, warmup_state′ = warmup!(sptr, sample, sampling_logdensity, stage, warmup_state)
         stage_information = (stage = stage, results = results, warmup_state = warmup_state′)
         (stages_and_results..., stage_information), warmup_state′
     end
@@ -1734,13 +1716,13 @@ Perform MCMC with NUTS, keeping the warmup results. Returns a `NamedTuple` of
     minor versions without being considered breaking. Recommended for interactive use.
 $(DOC_MCMC_ARGS)
 """
-function mcmc_keep_warmup(rng::AbstractRNG, ℓ, N::Integer;
+function mcmc_keep_warmup(rng::AbstractRNG, sptr::StackPointer, ℓ, N::Integer;
                           initialization = (),
                           warmup_stages = default_warmup_stages(),
                           algorithm = NUTS(),
                           reporter = default_reporter())
     sampling_logdensity = SamplingLogDensity(rng, ℓ, algorithm, reporter)
-    initial_warmup_state = initialize_warmup_state(rng, ℓ; initialization...)
+    sptr, initial_warmup_state = initialize_warmup_state(rng, sptr, ℓ; initialization...)
     warmup, warmup_state = _warmup(sampling_logdensity, warmup_stages, initial_warmup_state)
     inference = mcmc(sampling_logdensity, N, warmup_state)
     (initial_warmup_state = initial_warmup_state, warmup = warmup,
@@ -1789,15 +1771,27 @@ function mcmc_with_warmup(rng, ℓ, N; initialization = (),
     (inference..., κ = κ, ϵ = ϵ)
 end
 
-function mcmc_with_warmup!(rng::AbstractRNG, sptr::StackPointer, ℓ::AbstractProbabilityModel, sample::AbstractMatrix, N = size(sample,2); initialization = (),
-    warmup_stages = default_warmup_stages(),
-    algorithm = NUTS(), reporter = default_reporter())
-@unpack final_warmup_state, inference =
-mcmc_keep_warmup(rng, ℓ, N; initialization = initialization,
-   warmup_stages = warmup_stages, algorithm = algorithm,
-   reporter = reporter)
-@unpack κ, ϵ = final_warmup_state
-(inference..., κ = κ, ϵ = ϵ)
+function mcmc_with_warmup!(
+    rng::AbstractRNG, sptr::StackPointer, sample::AbstractMatrix, ℓ::AbstractProbabilityModel, N = size(sample,2);
+    initialization = (), warmup_stages = default_warmup_stages(), algorithm = NUTS(), reporter = default_reporter()
+)
+
+    sampling_logdensity = SamplingLogDensity(rng, ℓ, algorithm, reporter)
+    sptr, initial_warmup_state = initialize_warmup_state(rng, sptr, ℓ; initialization...)
+    warmup, warmup_state = _warmup!(sptr, sample, sampling_logdensity, warmup_stages, initial_warmup_state)
+    inference = mcmc(sampling_logdensity, N, warmup_state)
+    (initial_warmup_state = initial_warmup_state, warmup = warmup,
+     final_warmup_state = warmup_state, inference = inference)
+
+
+    @unpack final_warmup_state, inference =
+        mcmc_keep_warmup(
+            rng, ℓ, N; initialization = initialization,
+            warmup_stages = warmup_stages, algorithm = algorithm,
+            reporter = reporter
+        )
+    @unpack κ, ϵ = final_warmup_state
+    (inference..., κ = κ, ϵ = ϵ)
 end
 
 
@@ -1809,7 +1803,7 @@ function threaded_mcmc(
     nthreads = ProbabilityModels.NTHREADS[]
     sptr = ProbabilityModels.STACK_POINTER_REF[]
     LSS = ProbabilityModels.LOCAL_STACK_SIZE[]
-    nwarmup = sum(length,warmup_stages)
+    nwarmup = maximum(length, warmup_stages)
     NS = max(N,nwarmup)
     L = VectorizationBase.align(D, Float64)
     samples = DynamicPaddedArray{Float64}(undef, (D, NS, nthreads), L)
@@ -1817,7 +1811,7 @@ function threaded_mcmc(
     Threads.@threads for t in 1:nthreads
         sample = DynamicPtrMatrix{Float64}(sample_ptr, (D, NS), L)
         rng =  ProbabilityModels.GLOBAL_PCGs[t]
-        mcmc_with_warmup!(rng, sptr, sample, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
+        mcmc_with_warmup!(rng, sptr, sample, ℓ, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
         sptr += LSS
         sample_ptr += sizeof(Float64)*NS*L
     end
