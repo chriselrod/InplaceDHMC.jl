@@ -18,11 +18,14 @@ using LinearAlgebra: Diagonal, Symmetric
 # using LogDensityProblems: capabilities, LogDensityOrder, dimension, logdensity_and_gradient
 # import NLSolversBase, Optim # optimization step in mcmc
 using Parameters: @unpack
-using Random: AbstractRNG, randn, Random, randexp
+using Random
 using Statistics: cov, mean, median, middle, quantile, var
 
-using VectorizationBase, LoopVectorization, StackPointers, PaddedMatrices, QuasiNewtonMethods
-using ProbabilityModels: AbstractProbabilityModel
+using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, PaddedMatrices, QuasiNewtonMethods, ProbabilityModels
+using QuasiNewtonMethods: logdensity, logdensity_and_gradient!
+using PaddedMatrices: Static
+using ProbabilityModels: AbstractProbabilityModel, dimension
+# using PaddedMatrices: AbstractFixedSizePaddedMatrix
 
 # copy from StatsFuns.jl
 function logaddexp(x, y)
@@ -30,6 +33,221 @@ function logaddexp(x, y)
     x > y ? x + log1p(exp(y - x)) : y + log1p(exp(x - y))
 end
 
+
+"""
+$(TYPEDEF)
+Kinetic energy specifications. Implements the methods
+- `Base.size`
+- [`kinetic_energy`](@ref)
+- [`calculate_p♯`](@ref)
+- [`∇kinetic_energy`](@ref)
+- [`rand_p`](@ref)
+For all subtypes, it is implicitly assumed that kinetic energy is symmetric in
+the momentum `p`,
+```julia
+kinetic_energy(κ, p, q) == kinetic_energy(κ, .-p, q)
+```
+When the above is violated, the consequences are undefined.
+"""
+abstract type KineticEnergy end
+
+"""
+$(TYPEDEF)
+Euclidean kinetic energies (position independent).
+"""
+abstract type EuclideanKineticEnergy <: KineticEnergy end
+
+"""
+$(TYPEDEF)
+Gaussian kinetic energy, with ``K(q,p) = p ∣ q ∼ 1/2 pᵀ⋅M⁻¹⋅p + log|M|`` (without constant),
+which is independent of ``q``.
+The inverse covariance ``M⁻¹`` is stored.
+!!! note
+    Making ``M⁻¹`` approximate the posterior variance is a reasonable starting point.
+"""
+struct GaussianKineticEnergy{P,T,L} <: EuclideanKineticEnergy
+    "M⁻¹"
+    M⁻¹::Diagonal{T,PtrVector{P,T,L,L,true}}
+    "W such that W*W'=M. Used for generating random draws."
+    W::Diagonal{T,PtrVector{P,T,L,L,true}}
+end
+
+# """
+# $(SIGNATURES)
+# Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
+# """
+# GaussianKineticEnergy(M⁻¹::AbstractMatrix) = GaussianKineticEnergy(M⁻¹, cholesky(inv(M⁻¹)).L)
+
+"""
+$(SIGNATURES)
+Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
+"""
+function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,L,true}}) where {P,T,L}
+    sptr, W = PtrVector{P,T,L,L}(sptr)
+    M⁻¹d = M⁻¹.diag
+    @fastmath @inbounds @simd for l ∈ 1:L
+        W[l] = one(T) / sqrt( M⁻¹d[l] )
+    end
+    sptr, GaussianKineticEnergy(M⁻¹, Diagonal( W ))
+end
+
+"""
+$(SIGNATURES)
+Gaussian kinetic energy with a diagonal inverse covariance matrix `M⁻¹=m⁻¹*I`.
+"""
+function GaussianKineticEnergy(sptr::StackPointer, ::Static{N}, m⁻¹::T = 1.0) where {N,T}
+    sptr, M⁻¹ = PtrVector{N,T}(sptr)
+    fill!(M⁻¹, m⁻¹)
+    GaussianKineticEnergy(sptr, Diagonal(M⁻¹))
+end
+
+@generated function GaussianKineticEnergy(sp::StackPointer, sample::AbstractMatrix{T}, λ::T, ::Val{D}) where {D,T}
+    W, Wshift = VectorizationBase.pick_vector_width_shift(M, T)
+    Wm1 = W-1
+    M = (D + Wm1) & ~Wm1
+    V = Vec{W,T}
+    # note that defining M as we did means Wrem == 0
+    MdW = (M + Wm1) >> W
+    Wrem = M & Wm1
+    size_T = sizeof(T)
+    WT = size_T*W
+    need_to_mask = Wrem > 0
+    reps_per_block = 4
+    blocked_reps, blocked_rem = divrem(MdW, reps_per_block)
+    if (MdW % (blocked_reps + 1)) == 0
+        blocked_reps, blocked_rem = blocked_reps + 1, 0
+        reps_per_block = MdW ÷ blocked_reps
+    end
+    if (need_to_mask && blocked_rem == 0) || blocked_reps == 1
+        blocked_rem += reps_per_block
+        blocked_reps -= 1
+    end
+    AL = VectorizationBase.align(M*size_T)
+    q = quote
+        ptr_s² = pointer(sp, $T)
+        regs² = PtrVector{$M,$T}(ptr_s²)
+        ptr_invs = ptr_s² + $AL
+        invs = PtrVector{$M,$T}(ptr_invs)
+
+        N = size(sample, 2)
+        ptr_sample = pointer(sample)
+        @fastmath begin
+            Ninv = one($T) / N
+            mulreg = N / ((N + λ)*(N - 1))
+            addreg = $(T(1e-3)) * λ / (N + λ)
+        end
+        vNinv = SIMDPirates.vbroadcast($V, Ninv)
+        vmulreg = SIMDPirates.vbroadcast($V, mulreg)
+        vaddreg = SIMDPirates.vbroadcast($V, addreg)        
+    end
+    if blocked_reps > 0
+        loop_block = regularized_cov_block_quote(W, T, reps_per_block, M, false)
+        body_quote = quote
+            $loop_block
+            ptr_sample += $WT*$reps_per_block
+            ptr_s² += $WT*$reps_per_block
+            ptr_invs += $WT*$reps_per_block
+        end
+        if blocked_reps > 1
+            body_quote = quote
+                for _ ∈ 1:$blocked_reps
+                    $body_quote
+                end
+            end
+        end
+        push!(q.args, body_quote)
+    end
+    if blocked_rem > 0
+        push!(q.args, regularized_cov_block_quote(W, T, blocked_rem, M, need_to_mask, VectorizationBase.mask(T,Wrem)))        
+    end
+    push!(q.args, :(sp + $(2AL), GaussianKineticEnergy(Diagonal(regs²), Diagonal(invs))))
+    q
+end
+
+
+function Base.show(io::IO, κ::GaussianKineticEnergy{T}) where {T}
+    print(io::IO, "Gaussian kinetic energy ($(Base.typename(T))), √diag(M⁻¹): $(.√(diag(κ.M⁻¹)))")
+end
+
+## NOTE about implementation: the 3 methods are callable without a third argument (`q`)
+## because they are defined for Gaussian (Euclidean) kinetic energies.
+
+Base.size(κ::GaussianKineticEnergy, args...) = size(κ.M⁻¹, args...)
+
+
+####
+#### Hamiltonian
+####
+
+struct Hamiltonian{P,T,N,L}
+    "The kinetic energy specification."
+    κ::GaussianKineticEnergy{P,T,N}
+    """
+    The (log) density we are sampling from. Supports the `LogDensityProblem` API.
+    Technically, it is the negative of the potential energy.
+    """
+    ℓ::L
+    """
+    $(SIGNATURES)
+    Construct a Hamiltonian from the log density `ℓ`, and the kinetic energy specification
+    `κ`. `ℓ` with a vector are expected to support the `LogDensityProblems` API, with
+    gradients.
+    """
+    function Hamiltonian(κ::GaussianKineticEnergy{P,T,N}, ℓ::L) where {P,T,N,L<:AbstractProbabilityModel{P}}
+        # @argcheck capabilities(ℓ) ≥ LogDensityOrder(1)
+        # @argcheck dimension(ℓ) == size(κ, 1)
+        new{P,T,N,L}(κ, ℓ)
+    end
+end
+
+Base.show(io::IO, H::Hamiltonian) = print(io, "Hamiltonian with $(H.κ)")
+
+"""
+$(TYPEDEF)
+A log density evaluated at position `q`. The log densities and gradient are saved, so that
+they are not calculated twice for every leapfrog step (both as start- and endpoints).
+Because of caching, a `EvaluatedLogDensity` should only be used with a specific Hamiltonian,
+preferably constructed with the `evaluate_ℓ` constructor.
+In composite types and arguments, `Q` is usually used for this type.
+"""
+struct EvaluatedLogDensity{P,T,L}
+    "Position."
+    q::PtrVector{P,T,L,L,true}
+    "ℓ(q). Saved for reuse in sampling."
+    ℓq::T
+    "∇ℓ(q). Cached for reuse in sampling."
+    ∇ℓq::PtrVector{P,T,L,L,true}
+    function EvaluatedLogDensity(q::PtrVector{P,T,L,L}, ℓq::T, ∇ℓq::PtrVector{P,T,L,L}) where {P,T,L}
+#        @argcheck length(q) == length(∇ℓq)
+        new{P,T,L}(q, ℓq, ∇ℓq)
+    end
+end
+
+# general constructors below are necessary to sanitize input from eg Diagnostics, or an
+# initial position given as integers, etc
+
+function EvaluatedLogDensity(q::AbstractVector, ℓq::Real, ∇ℓq::AbstractVector)
+    q, ∇ℓq = promote(q, ∇ℓq)
+    EvaluatedLogDensity(q, ℓq, ∇ℓq)
+end
+
+EvaluatedLogDensity(q, ℓq::Real, ∇ℓq) = EvaluatedLogDensity(collect(q), ℓq, collect(∇ℓq))
+
+"""
+$(TYPEDEF)
+A point in phase space, consists of a position (in the form of an evaluated log density `ℓ`
+at `q`) and a momentum.
+"""
+struct PhasePoint{P,T,L}
+    "Evaluated log density."
+    Q::EvaluatedLogDensity{P,T,L}
+    "Momentum."
+    p::PtrVector{P,T,L,L,true}
+    # function PhasePoint(Q::EvaluatedLogDensity, p::S) where {T,S}
+        # @argcheck length(p) == length(Q.q)
+        # new{T,S}(Q, p)
+    # end
+end
 
 
 
@@ -221,7 +439,7 @@ encounteted and invalidated this tree.
     - `i′`: the position of the last node relative to the initial node.
 The *second value* is always the visited node statistic.
 """
-function adjacent_tree(rng, sptr::StackPointer, trajectory, z::, i, depth, is_forward) where {P,T,L}
+function adjacent_tree(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,T,L}, i, depth, is_forward) where {P,T,L}
     i′ = i + (is_forward ? 1 : -1)
     if depth == 0 # moves from z into ζready
         z′ = move(sptr, trajectory, z, is_forward)
@@ -264,8 +482,8 @@ Return the following values
 - `depth`: the depth of the tree that was sampled from. Doubling steps that lead to an
   invalid adjacent tree do not contribute to `depth`.
 """
-function sample_trajectory(rng, trajectory, z::PtrVector{P,T,L,L}, max_depth::Integer, directions::Directions) where {P,T,L,L}
-    @argcheck max_depth ≤ MAX_DIRECTIONS_DEPTH
+function sample_trajectory(rng, trajectory, z::PtrVector{P,T,L,L}, max_depth::Integer, directions::Directions) where {P,T,L}
+#    @argcheck max_depth ≤ MAX_DIRECTIONS_DEPTH
     (ζ, ω, τ), v, invalid = leaf(trajectory, z, true)
     z₋ = z₊ = z
     depth = 0
@@ -315,141 +533,6 @@ end
 ####
 
 """
-$(TYPEDEF)
-Kinetic energy specifications. Implements the methods
-- `Base.size`
-- [`kinetic_energy`](@ref)
-- [`calculate_p♯`](@ref)
-- [`∇kinetic_energy`](@ref)
-- [`rand_p`](@ref)
-For all subtypes, it is implicitly assumed that kinetic energy is symmetric in
-the momentum `p`,
-```julia
-kinetic_energy(κ, p, q) == kinetic_energy(κ, .-p, q)
-```
-When the above is violated, the consequences are undefined.
-"""
-abstract type KineticEnergy end
-
-"""
-$(TYPEDEF)
-Euclidean kinetic energies (position independent).
-"""
-abstract type EuclideanKineticEnergy <: KineticEnergy end
-
-"""
-$(TYPEDEF)
-Gaussian kinetic energy, with ``K(q,p) = p ∣ q ∼ 1/2 pᵀ⋅M⁻¹⋅p + log|M|`` (without constant),
-which is independent of ``q``.
-The inverse covariance ``M⁻¹`` is stored.
-!!! note
-    Making ``M⁻¹`` approximate the posterior variance is a reasonable starting point.
-"""
-struct GaussianKineticEnergy{P,T,L} <: EuclideanKineticEnergy
-    "M⁻¹"
-    M⁻¹::Diagonal{T,PtrVector{P,T,L,L,true}}
-    "W such that W*W'=M. Used for generating random draws."
-    W::Diagonal{T,PtrVector{P,T,L,L,true}}
-end
-
-# """
-# $(SIGNATURES)
-# Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
-# """
-# GaussianKineticEnergy(M⁻¹::AbstractMatrix) = GaussianKineticEnergy(M⁻¹, cholesky(inv(M⁻¹)).L)
-
-"""
-$(SIGNATURES)
-Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
-"""
-function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,L,true}}) where {P,T,L}
-    sptr, W = PtrVector{P,T,L,L,true}(sptr)
-    M⁻¹d = M⁻¹.diag
-    @fastmath @inbounds @simd for l ∈ 1:L
-        W[l] = one(T) / sqrt( M⁻¹d[l] )
-    end
-    sptr, GaussianKineticEnergy(M⁻¹, Diagonal( W ))
-end
-
-"""
-$(SIGNATURES)
-Gaussian kinetic energy with a diagonal inverse covariance matrix `M⁻¹=m⁻¹*I`.
-"""
-function GaussianKineticEnergy(sptr::StackPointer, ::Val{N}, m⁻¹::T = 1.0) where {N,T}
-    sptr, M⁻¹ = PtrVector{N,T}(sptr)
-    fill!(M⁻¹, m⁻¹)
-    GaussianKineticEnergy(sptr, Diagonal(M⁻¹))
-end
-
-@generated function GaussianKineticEnergy(sp::StackPointer, sample::AbstractMatrix{T}, λ::T, ::Val{D}) where {D,T}
-    W, Wshift = VectorizationBase.pick_vector_width_shift(M, T)
-    Wm1 = W-1
-    M = (D + Wm1) & ~Wm1
-    V = Vec{W,T}
-    # note that defining M as we did means Wrem == 0
-    MdW = (M + Wm1) >> W
-    Wrem = M & Wm1
-    size_T = sizeof(T)
-    WT = size_T*W
-    need_to_mask = Wrem > 0
-    reps_per_block = 4
-    blocked_reps, blocked_rem = divrem(MdW, reps_per_block)
-    if (MdW % (blocked_reps + 1)) == 0
-        blocked_reps, blocked_rem = blocked_reps + 1, 0
-        reps_per_block = MdW ÷ blocked_reps
-    end
-    if (need_to_mask && blocked_rem == 0) || blocked_reps == 1
-        blocked_rem += reps_per_block
-        blocked_reps -= 1
-    end
-    AL = VectorizationBase.align(M*size_T)
-    q = quote
-        ptr_s² = pointer(sp, $T)
-        regs² = PtrVector{$M,$T}(ptr_s²)
-        ptr_invs = ptr_s² + $AL
-        invs = PtrVector{$M,$T}(ptr_invs)
-
-        N = size(sample, 2)
-        ptr_sample = pointer(sample)
-        @fastmath begin
-            Ninv = one($T) / N
-            mulreg = N / ((N + λ)*(N - 1))
-            addreg = $(T(1e-3)) * λ / (N + λ)
-        end
-        vNinv = SIMDPirates.vbroadcast($V, Ninv)
-        vmulreg = SIMDPirates.vbroadcast($V, mulreg)
-        vaddreg = SIMDPirates.vbroadcast($V, addreg)        
-    end
-    if blocked_reps > 
-        loop_block = regularized_cov_block_quote(W, T, reps_per_block, M, false)
-        block_rep_quote = quote
-            for _ ∈ 1:$blocked_reps
-                $loop_block
-                ptr_sample += $WT*$reps_per_block
-                ptr_s² += $WT*$reps_per_block
-                ptr_invs += $WT*$reps_per_block
-            end
-        end
-        push!(q.args, block_rep_quote)
-    end
-    if blocked_rem > 0
-        push!(q.args, regularized_cov_block_quote(W, T, blocked_rem, M, need_to_mask, VectorizationBase.mask(T,Wrem)))        
-    end
-    push!(q.args, :(sp + $(2AL), GaussianKineticEnergy(Diagonal(regs²), Diagonal(invs))))
-    q
-end
-
-
-function Base.show(io::IO, κ::GaussianKineticEnergy{T}) where {T}
-    print(io::IO, "Gaussian kinetic energy ($(Base.typename(T))), √diag(M⁻¹): $(.√(diag(κ.M⁻¹)))")
-end
-
-## NOTE about implementation: the 3 methods are callable without a third argument (`q`)
-## because they are defined for Gaussian (Euclidean) kinetic energies.
-
-Base.size(κ::GaussianKineticEnergy, args...) = size(κ.M⁻¹, args...)
-
-"""
 $(SIGNATURES)
 Return kinetic energy `κ`, at momentum `p`.
 """
@@ -470,7 +553,7 @@ end
 $(SIGNATURES)
 Return ``p♯ = M⁻¹⋅p``, used for turn diagnostics.
 """
-function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing)
+function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹
     sptr, M⁻¹p = PtrVector{P,T,L,L}(sptr)
     @inbounds @simd for l ∈ 1:L
@@ -495,63 +578,6 @@ function rand_p(sptr::StackPointer, rng::AbstractRNG, κ::GaussianKineticEnergy{
     sptr, randn!(rng, r, W)
 end
 
-####
-#### Hamiltonian
-####
-
-struct Hamiltonian{K,L}
-    "The kinetic energy specification."
-    κ::K
-    """
-    The (log) density we are sampling from. Supports the `LogDensityProblem` API.
-    Technically, it is the negative of the potential energy.
-    """
-    ℓ::L
-    """
-    $(SIGNATURES)
-    Construct a Hamiltonian from the log density `ℓ`, and the kinetic energy specification
-    `κ`. `ℓ` with a vector are expected to support the `LogDensityProblems` API, with
-    gradients.
-    """
-    function Hamiltonian(κ::K, ℓ::L) where {K <: GaussianKineticEnergy{P,T},L<:AbstractProbabilityModel{P}}
-        # @argcheck capabilities(ℓ) ≥ LogDensityOrder(1)
-        # @argcheck dimension(ℓ) == size(κ, 1)
-        new{K,L}(κ, ℓ)
-    end
-end
-
-Base.show(io::IO, H::Hamiltonian) = print(io, "Hamiltonian with $(H.κ)")
-
-"""
-$(TYPEDEF)
-A log density evaluated at position `q`. The log densities and gradient are saved, so that
-they are not calculated twice for every leapfrog step (both as start- and endpoints).
-Because of caching, a `EvaluatedLogDensity` should only be used with a specific Hamiltonian,
-preferably constructed with the `evaluate_ℓ` constructor.
-In composite types and arguments, `Q` is usually used for this type.
-"""
-struct EvaluatedLogDensity{P,T,L}
-    "Position."
-    q::PtrVector{P,T,L,L,true}
-    "ℓ(q). Saved for reuse in sampling."
-    ℓq::T
-    "∇ℓ(q). Cached for reuse in sampling."
-    ∇ℓq::PtrVector{P,T,L,L,true}
-    function EvaluatedLogDensity(q::PtrVector{P,T,L,L}, ℓq::T, ∇ℓq::PtrVector{P,T,L,L}) where {P,T,L}
-#        @argcheck length(q) == length(∇ℓq)
-        new{P,T,L}(q, ℓq, ∇ℓq)
-    end
-end
-
-# general constructors below are necessary to sanitize input from eg Diagnostics, or an
-# initial position given as integers, etc
-
-function EvaluatedLogDensity(q::AbstractVector, ℓq::Real, ∇ℓq::AbstractVector)
-    q, ∇ℓq = promote(q, ∇ℓq)
-    EvaluatedLogDensity(q, ℓq, ∇ℓq)
-end
-
-EvaluatedLogDensity(q, ℓq::Real, ∇ℓq) = EvaluatedLogDensity(collect(q), ℓq, collect(∇ℓq))
 
 """
 $(SIGNATURES)
@@ -569,22 +595,6 @@ function evaluate_ℓ(sptr::StackPointer, ℓ::AbstractProbabilityModel{P}, q::P
 end
 
 """
-$(TYPEDEF)
-A point in phase space, consists of a position (in the form of an evaluated log density `ℓ`
-at `q`) and a momentum.
-"""
-struct PhasePoint{P,T,L}
-    "Evaluated log density."
-    Q::EvaluatedLogDensity{P,T,L}
-    "Momentum."
-    p::PtrVector{P,T,L,L,true}
-    # function PhasePoint(Q::EvaluatedLogDensity, p::S) where {T,S}
-        # @argcheck length(p) == length(Q.q)
-        # new{T,S}(Q, p)
-    # end
-end
-
-"""
 $(SIGNATURES)
 Log density for Hamiltonian `H` at point `z`.
 If `ℓ(q) == -Inf` (rejected), skips the kinetic energy calculation.
@@ -594,7 +604,7 @@ if
 2. the kinetic energy is not a finite value (which usually happens when `NaN` or `Inf` got
 mixed in the leapfrog step, leading to an invalid position).
 """
-function logdensity(H::Hamiltonian{<:EuclideanKineticEnergy}, z::PhasePoint)
+function QuasiNewtonMethods.logdensity(H::Hamiltonian{<:EuclideanKineticEnergy}, z::PhasePoint)
     @unpack ℓq = z.Q
     isfinite(ℓq) || return oftype(ℓq, -Inf)
     K = kinetic_energy(H.κ, z.p)
@@ -640,9 +650,9 @@ function leapfrog(sp::StackPointer,
     @fastmath @inbounds @simd for l ∈ 1:L
         p′[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
     end
-    sp + 3B, DynamicHMC.PhasePoint(Q′, p′)
+    sp + 3B, PhasePoint(Q′, p′)
 end
-# function DynamicHMC.move(sp::StackPointer, trajectory::DynamicHMC.TrajectoryNUTS, z, fwd)
+# function move(sp::StackPointer, trajectory::TrajectoryNUTS, z, fwd)
     # @unpack H, ϵ = trajectory
     # leapfrog(sp, H, z, fwd ? ϵ : -ϵ)
 # end
@@ -689,11 +699,11 @@ struct InitialStepsizeSearch
     maxiter_bisect::Int
     function InitialStepsizeSearch(; a_min = 0.25, a_max = 0.75, ϵ₀ = 1.0, C = 2.0,
                                    maxiter_crossing = 400, maxiter_bisect = 400)
-        @argcheck 0 < a_min < a_max < 1
-        @argcheck 0 < ϵ₀
-        @argcheck 1 < C
-        @argcheck maxiter_crossing ≥ 50
-        @argcheck maxiter_bisect ≥ 50
+        # @argcheck 0 < a_min < a_max < 1
+        # @argcheck 0 < ϵ₀
+        # @argcheck 1 < C
+        # @argcheck maxiter_crossing ≥ 50
+        # @argcheck maxiter_bisect ≥ 50
         new(a_min, a_max, ϵ₀, C, maxiter_crossing, maxiter_bisect)
     end
 end
@@ -741,8 +751,8 @@ the cached `A` values have the correct ordering.
 """
 function bisect_stepsize(parameters, A, ϵ₀, ϵ₁, Aϵ₀ = A(ϵ₀), Aϵ₁ = A(ϵ₁))
     @unpack a_min, a_max, maxiter_bisect = parameters
-    @argcheck ϵ₀ < ϵ₁
-    @argcheck Aϵ₀ > a_max && Aϵ₁ < a_min
+    # @argcheck ϵ₀ < ϵ₁
+    # @argcheck Aϵ₀ > a_max && Aϵ₁ < a_min
     for _ in 1:maxiter_bisect
         ϵₘ = middle(ϵ₀, ϵ₁)
         Aϵₘ = A(ϵₘ)
@@ -834,10 +844,10 @@ struct DualAveraging{T}
     "offset"
     t₀::Int
     function DualAveraging(δ::T, γ::T, κ::T, t₀::Int) where {T <: Real}
-        @argcheck 0 < δ < 1
-        @argcheck γ > 0
-        @argcheck 0.5 < κ ≤ 1
-        @argcheck t₀ ≥ 0
+        # @argcheck 0 < δ < 1
+        # @argcheck γ > 0
+        # @argcheck 0.5 < κ ≤ 1
+        # @argcheck t₀ ≥ 0
         new{T}(δ, γ, κ, t₀)
     end
 end
@@ -860,7 +870,7 @@ $(SIGNATURES)
 Return an initial adaptation state for the adaptation method and a stepsize `ϵ`.
 """
 function initial_adaptation_state(::DualAveraging, ϵ)
-    @argcheck ϵ > 0
+    # @argcheck ϵ > 0
     logϵ = log(ϵ)
     DualAveragingState(log(10) + logϵ, 0, zero(logϵ), logϵ, zero(logϵ))
 end
@@ -872,7 +882,7 @@ over the whole visited trajectory, using the dual averaging algorithm of Gelman 
 (2014, Algorithm 6). Return the new adaptation state.
 """
 function adapt_stepsize(parameters::DualAveraging, A::DualAveragingState, a)
-    @argcheck 0 ≤ a ≤ 1
+    # @argcheck 0 ≤ a ≤ 1
     @unpack δ, γ, κ, t₀ = parameters
     @unpack μ, m, H̄, logϵ, logϵ̄ = A
     m += 1
@@ -1024,7 +1034,7 @@ end
 function is_turning(::TrajectoryNUTS, τ::GeneralizedTurnStatistic)
     # Uses the generalized NUTS criterion from Betancourt (2017).
     @unpack p♯₋, p♯₊, ρ = τ
-    @argcheck p♯₋ ≢ p♯₊ "internal error: is_turning called on a leaf"
+    # @argcheck p♯₋ ≢ p♯₊ "internal error: is_turning called on a leaf"
     dot(p♯₋, ρ) < 0 || dot(p♯₊, ρ) < 0
 end
 
@@ -1071,8 +1081,8 @@ struct NUTS{S}
     turn_statistic_configuration::S
     function NUTS(; max_depth = DEFAULT_MAX_TREE_DEPTH, min_Δ = -1000.0,
                   turn_statistic_configuration = Val{:generalized}())
-        @argcheck 0 < max_depth ≤ MAX_DIRECTIONS_DEPTH
-        @argcheck min_Δ < 0
+        # @argcheck 0 < max_depth ≤ MAX_DIRECTIONS_DEPTH
+        # @argcheck min_Δ < 0
         S = typeof(turn_statistic_configuration)
         new{S}(Int(max_depth), Float64(min_Δ), turn_statistic_configuration)
     end
@@ -1213,7 +1223,7 @@ function report(reporter::LogMCMCReport, step::Integer; meta...)
     @unpack (log_progress_report, total_steps, last_reported_step,
              last_reported_time_ns) = reporter
     @unpack chain_id, step_interval, time_interval_s = log_progress_report
-    @argcheck 1 ≤ step ≤ total_steps
+    # @argchecky 1 ≤ step ≤ total_steps
     Δ_steps = step - last_reported_step
     t_ns = time_ns()
     Δ_time_s = (t_ns - last_reported_time_ns) / 1_000_000_000
@@ -1322,7 +1332,7 @@ end
 $(SIGNATURES)
 Helper function to create random starting positions in the `[-2,2]ⁿ` box.
 """
-function random_position(sptr::StackPointer, rng, ::Val{P}) where {P}
+function random_position(rng::AbstractRNG, sptr::StackPointer, ::Static{P}) where {P}
     sptr, r = PtrVector{P,Float64}(sptr)
     sptr, rand!(rng, r, -2.0, 2.0)
 end
@@ -1352,7 +1362,7 @@ function initialize_warmup_state(rng, sptr, ℓ; q = nothing, κ = nothing, ϵ =
     else
         κ′ = κ
     end
-    sptr, eℓ = evaluate_ℓ(ℓ, q′)
+    sptr, eℓ = evaluate_ℓ(sptr, ℓ, q′)
     sptr, WarmupState(eℓ, κ′, ϵ)
 end
 
@@ -1401,7 +1411,7 @@ function warmup!(
     ∇ℓq = PtrVector{D,Float64}(pointer(sp,Float64))
     sptr, (nothing, WarmupState(EvaluatedLogDensity(q, ℓq, ∇ℓq), κ, ϵ))
 end
-
+Base.length(::FindLocalOptimum) = 0
 function warmup!(sp::StackPointer, sample::AbstractMatrix, sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
     @unpack rng, ℓ, reporter = sampling_logdensity
     @unpack Q, κ, ϵ = warmup_state
@@ -1412,7 +1422,7 @@ function warmup!(sp::StackPointer, sample::AbstractMatrix, sampling_logdensity, 
            ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
     nothing, WarmupState(Q, κ, ϵ)
 end
-
+Base.length(::InitialStepsizeSearch) = 0
 """
 $(TYPEDEF)
 Tune the step size `ϵ` during sampling, and the metric of the kinetic energy at the end of
@@ -1441,8 +1451,8 @@ struct TuningNUTS{M,D}
     λ::Float64
     function TuningNUTS{M}(N::Integer, stepsize_adaptation::D,
                            λ = 5.0/N) where {M <: Union{Nothing,Diagonal,Symmetric},D}
-        @argcheck N ≥ 20        # variance estimator is kind of meaningless for few samples
-        @argcheck λ ≥ 0
+        # @argcheck N ≥ 20        # variance estimator is kind of meaningless for few samples
+        # @argcheck λ ≥ 0
         new{M,D}(N, stepsize_adaptation, λ)
     end
 end
@@ -1484,7 +1494,7 @@ function warmup!(
     chain_ptr = pointer(chain)
     tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
     H = Hamiltonian(κ, ℓ)
-    ϵ_state = DynamicHMC.initial_adaptation_state(stepsize_adaptation, ϵ)
+    ϵ_state = initial_adaptation_state(stepsize_adaptation, ϵ)
     ϵs = Vector{Float64}(undef, N)
     mcmc_reporter = make_mcmc_reporter(reporter, N; tuning = "stepsize and Diagonal{T,PtrVector{}} metric")
     for i in 1:N
@@ -1808,7 +1818,8 @@ function threaded_mcmc(
     L = VectorizationBase.align(D, Float64)
     samples = DynamicPaddedArray{Float64}(undef, (D, NS, nthreads), L)
     sample_ptr = pointer(samples)
-    Threads.@threads for t in 1:nthreads
+    # Threads.@threads
+    for t in 1:nthreads
         sample = DynamicPtrMatrix{Float64}(sample_ptr, (D, NS), L)
         rng =  ProbabilityModels.GLOBAL_PCGs[t]
         mcmc_with_warmup!(rng, sptr, sample, ℓ, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
@@ -1834,13 +1845,13 @@ module Diagnostics
 export EBFMI, summarize_tree_statistics, explore_log_acceptance_ratios, leapfrog_trajectory,
     InvalidTree, REACHED_MAX_DEPTH, is_divergent
 
-using DynamicHMC: GaussianKineticEnergy, Hamiltonian, evaluate_ℓ, InvalidTree,
+using InplaceDHMC: GaussianKineticEnergy, Hamiltonian, evaluate_ℓ, InvalidTree,
     REACHED_MAX_DEPTH, is_divergent, log_acceptance_ratio, PhasePoint, rand_p, leapfrog,
     logdensity, MAX_DIRECTIONS_DEPTH
 
-using ArgCheck: @argcheck
+# using ArgCheck: @argcheck
 using DocStringExtensions: FIELDS, SIGNATURES, TYPEDEF
-using LogDensityProblems: dimension
+using ProbabilityModels: dimension
 using Parameters: @unpack
 import Random
 using Statistics: mean, quantile, var
@@ -2023,7 +2034,7 @@ function leapfrog_trajectory(ℓ, q, ϵ, positions::UnitRange{<:Integer};
                              rng = Random.GLOBAL_RNG,
                              κ = GaussianKineticEnergy(dimension(ℓ)), p = rand_p(rng, κ))
     A, B = first(positions), last(positions)
-    @argcheck A ≤ 0 ≤ B "Positions has to contain `0`."
+    # @argcheck A ≤ 0 ≤ B "Positions has to contain `0`."
     Q = evaluate_ℓ(ℓ, q)
     H = Hamiltonian(κ, ℓ)
     z₀ = PhasePoint(Q, p)
