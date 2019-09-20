@@ -261,7 +261,7 @@ end
 ####
 
 "Maximum number of iterations [`next_direction`](@ref) supports."
-const MAX_DIRECTIONS_DEPTH = 64
+const MAX_DIRECTIONS_DEPTH = 32
 
 """
 Internal type implementing random directions. Draw a new value with `rand`, see
@@ -270,10 +270,10 @@ Serves two purposes: a fixed value of `Directions` is useful for unit testing, a
 single bit flag collection economizes on the RNG cost.
 """
 struct Directions
-    flags::UInt64
+    flags::UInt32
 end
 
-Base.rand(rng::AbstractRNG, ::Type{Directions}) = Directions(rand(rng, UInt64))
+Base.rand(rng::AbstractRNG, ::Type{Directions}) = Directions(rand(rng, UInt32))
 
 """
 $(SIGNATURES)
@@ -422,6 +422,41 @@ end
 const REACHED_MAX_DEPTH = InvalidTree(1, 0)
 
 # topptr(a::Ptr{T}, b::Ptr{T}) where {T} = reinterpret(Ptr{T}, max(reinterpret(UInt, a), reinterpret(UInt, b)))
+
+free_reference!(ptr::Ptr) = free_reference!(reinterpret(Ptr{UInt8}), ptr)
+function free_reference!(ptr::Ptr{UInt8})
+    VectorizationBase.store!( ptr, VectorizationBase.load(ptr) - 0x01 )
+end
+
+# on tree initialization, store
+struct Tree{D,T,L}
+    root::Ptr{T}
+    depth::Int
+end
+function Tree(sptr::StackPointer, depth::Int, ::PtrVector{D,T,L}) where {D,T,L}
+    root = pointer(sptr, T)
+    uroot = reinterpret(Ptr{UInt}, root)
+    W = VectorizationBase.pick_vector_width(UInt)
+    # set roots to zero so that all loads can properly be interpreted as bools without further processing on future accesses.
+    SIMDPirates.vstore!(uroot, SIMDPirates.vbroadcast(Vec{W,UInt}, zero(UInt))) 
+    sptr + 2MAX_DIRECTIONS_DEPTH + 4L*(depth+1), Tree{D,T,L}( root, depth )
+end
+function undefined_phase_point(tree::Tree{D,T,L})
+    @unpack root, depth = tree
+    stump = root + VectorizationBase.REGISTER_SIZE
+    i = 0
+    broot = reinterpret(Ptr{Bool}, root)
+    while true
+        VectorizationBase.load(broot) || break
+        
+    end
+     
+end
+function undefined_search_direction(tree::Tree{D,T,L})
+
+end
+
+
 
 """
     result, v = adjacent_tree(rng, trajectory, z, i, depth, is_forward)
