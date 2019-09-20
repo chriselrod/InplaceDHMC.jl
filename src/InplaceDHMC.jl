@@ -22,9 +22,9 @@ using Random
 using Statistics: cov, mean, median, middle, quantile, var
 
 using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, PaddedMatrices, QuasiNewtonMethods, ProbabilityModels
-using QuasiNewtonMethods: logdensity, logdensity_and_gradient!
+using QuasiNewtonMethods: AbstractProbabilityModel, dimension, logdensity, logdensity_and_gradient!
 using PaddedMatrices: Static
-using ProbabilityModels: AbstractProbabilityModel, dimension
+# using ProbabilityModels: 
 # using PaddedMatrices: AbstractFixedSizePaddedMatrix
 
 # copy from StatsFuns.jl
@@ -101,12 +101,53 @@ function GaussianKineticEnergy(sptr::StackPointer, ::Static{N}, m⁻¹::T = 1.0)
     GaussianKineticEnergy(sptr, Diagonal(M⁻¹))
 end
 
+
+function regularized_cov_block_quote(W::Int, T, reps_per_block::Int, stride::Int, mask_last::Bool = false, mask::Unsigned = 0xff)
+    # loads from ptr_sample
+    # stores in ptr_s² and ptr_invs
+    # needs vNinv, mulreg, and addreg to be defined
+    reps_per_block -= 1
+    WT = sizeof(T)*W
+    V = Vec{W,T}
+    quote
+        $([Expr(:(=), Symbol(:μ_,i), :(SIMDPirates.vload($V, ptr_sample + $(WT*i), $([mask for _ ∈ 1:((i==reps_per_block) & mask_last)]...)))) for i ∈ 0:reps_per_block]...)
+        $([Expr(:(=), Symbol(:Σδ_,i), :(SIMDPirates.vbroadcast($V,zero($T)))) for i ∈ 0:reps_per_block]...)
+        $([Expr(:(=), Symbol(:Σδ²_,i), :(SIMDPirates.vbroadcast($V,zero($T)))) for i ∈ 0:reps_per_block]...)
+        for n ∈ 1:N-1
+            $([Expr(:(=), Symbol(:δ_,i), :(SIMDPirates.vsub(SIMDPirates.vload(ptrS + $(WT*i) + n*$stride*$size_T),$(Symbol(:μ_,i))))) for i ∈ 0:reps_per_block]...)
+            $([Expr(:(=), Symbol(:Σδ_,i), :(SIMDPirates.vadd($(Symbol(:δ_,i)),$(Symbol(:Σδ_,i))))) for i ∈ 0:reps_per_block]...)
+            $([Expr(:(=), Symbol(:Σδ²_,i), :(SIMDPirates.vmuladd($(Symbol(:δ_,i)),$(Symbol(:δ_,i)),$(Symbol(:Σδ²_,i))))) for i ∈ 0:reps_per_block]...)
+        end
+        $([Expr(:(=), Symbol(:ΣδΣδ_,i), :(SIMDPirates.vmul($(Symbol(:Σδ_,i)),$(Symbol(:Σδ_,i))))) i ∈ 0:reps_per_block]..)
+        $([Expr(:(=), Symbol(:s²nm1_,i), :(SIMDPirates.vfnmadd($(Symbol(:ΣδΣδ_,i)),vNinv,$(Symbol(:Σδ²_,i))))) for i ∈ 0:reps_per_block]..)
+        $([Expr(:(=), Symbol(:regs²_,i), :(SIMDPirates.vmuladd($(Symbol(:s²nm1_,i)), vmulreg, vaddreg))) for i ∈ 0:reps_per_block]...)
+        $([Expr(:(=), Symbol(:reginvs_,i), :(SIMDPirates.rsqrt($(Symbol(:regs²_,i))))) for i ∈ 0:reps_per_block]...)
+        $([:(vstore!(ptr_s² + $(WT*i), $(Symbol(:regs²_,i)), $([mask for _ ∈ 1:((i==reps_per_block) & mask_last)]...))) for i ∈ 0:reps_per_block]...)
+        $([:(vstore!(ptr_invs + $(WT*i), $(Symbol(:reginvs_,i)), $([mask for _ ∈ 1:((i==reps_per_block) & mask_last)]...))) for i ∈ 0:reps_per_block]...)
+    end
+end
+
 @generated function GaussianKineticEnergy(sp::StackPointer, sample::AbstractMatrix{T}, λ::T, ::Val{D}) where {D,T}
     W, Wshift = VectorizationBase.pick_vector_width_shift(M, T)
     Wm1 = W-1
     M = (D + Wm1) & ~Wm1
+    AL = VectorizationBase.align(M*size_T)
+    quote
+        ptr_s² = pointer(sp, $T)
+        regs² = PtrVector{$M,$T}(ptr_s²)
+        ptr_invs = ptr_s² + $AL
+        invs = PtrVector{$M,$T}(ptr_invs)
+        sp + $(2AL), GaussianKineticEnergy!(regs², invs, sample, λ)
+    end
+end
+
+GaussianKineticEnergy!(K::GaussianKineticEnergy, sample::AbstractMatrix, λ) = GaussianKineticEnergy!(K.M⁻¹, K.W, sample, λ)
+
+@generated function GaussianKineticEnergy!(regs²::PtrVector{D,T,M,M}, invs::PtrVector{D,T,M,M}, sample::AbstractMatrix{T}, λ::T) where {D,T,M}
+    W, Wshift = VectorizationBase.pick_vector_width_shift(M, T)
+    Wm1 = W-1
+    M = (D + Wm1) & ~Wm1
     V = Vec{W,T}
-    # note that defining M as we did means Wrem == 0
     MdW = (M + Wm1) >> W
     Wrem = M & Wm1
     size_T = sizeof(T)
@@ -122,12 +163,14 @@ end
         blocked_rem += reps_per_block
         blocked_reps -= 1
     end
-    AL = VectorizationBase.align(M*size_T)
+    # AL = VectorizationBase.align(M*size_T)
     q = quote
-        ptr_s² = pointer(sp, $T)
-        regs² = PtrVector{$M,$T}(ptr_s²)
-        ptr_invs = ptr_s² + $AL
-        invs = PtrVector{$M,$T}(ptr_invs)
+        # ptr_s² = pointer(sp, $T)
+        # regs² = PtrVector{$M,$T}(ptr_s²)
+        # ptr_invs = ptr_s² + $AL
+        # invs = PtrVector{$M,$T}(ptr_invs)
+        ptr_s² = pointer(regs²)
+        ptr_invs = pointer(invs)
 
         N = size(sample, 2)
         ptr_sample = pointer(sample)
@@ -160,10 +203,9 @@ end
     if blocked_rem > 0
         push!(q.args, regularized_cov_block_quote(W, T, blocked_rem, M, need_to_mask, VectorizationBase.mask(T,Wrem)))        
     end
-    push!(q.args, :(sp + $(2AL), GaussianKineticEnergy(Diagonal(regs²), Diagonal(invs))))
+    push!(q.args, :(GaussianKineticEnergy(Diagonal(regs²), Diagonal(invs))))
     q
 end
-
 
 function Base.show(io::IO, κ::GaussianKineticEnergy{T}) where {T}
     print(io::IO, "Gaussian kinetic energy ($(Base.typename(T))), √diag(M⁻¹): $(.√(diag(κ.M⁻¹)))")
@@ -172,7 +214,8 @@ end
 ## NOTE about implementation: the 3 methods are callable without a third argument (`q`)
 ## because they are defined for Gaussian (Euclidean) kinetic energies.
 
-Base.size(κ::GaussianKineticEnergy, args...) = size(κ.M⁻¹, args...)
+Base.size(κ::GaussianKineticEnergy{P}) where {P} = (P,P)
+# Base.size(κ::GaussianKineticEnergy, args...) = size(κ.M⁻¹, args...)
 
 
 ####
@@ -217,7 +260,7 @@ struct EvaluatedLogDensity{P,T,L}
     ℓq::T
     "∇ℓ(q). Cached for reuse in sampling."
     ∇ℓq::PtrVector{P,T,L,L,true}
-    function EvaluatedLogDensity(q::PtrVector{P,T,L,L}, ℓq::T, ∇ℓq::PtrVector{P,T,L,L}) where {P,T,L}
+    function EvaluatedLogDensity(q::PtrVector{P,T,L,L,true}, ℓq::T, ∇ℓq::PtrVector{P,T,L,L,true}) where {P,T<:Real,L}
 #        @argcheck length(q) == length(∇ℓq)
         new{P,T,L}(q, ℓq, ∇ℓq)
     end
@@ -237,20 +280,24 @@ EvaluatedLogDensity(q, ℓq::Real, ∇ℓq) = EvaluatedLogDensity(collect(q), �
 $(TYPEDEF)
 A point in phase space, consists of a position (in the form of an evaluated log density `ℓ`
 at `q`) and a momentum.
+
+Canonical memory layout:
+p
+Q.q
+Q.∇ℓq
 """
-struct PhasePoint{P,T,L}
+struct PhasePoint{P,T,N,L}
     "Evaluated log density."
     Q::EvaluatedLogDensity{P,T,L}
     "Momentum."
-    p::PtrVector{P,T,L,L,true}
+    p::PtrVector{P,T,N,N,true}
     # function PhasePoint(Q::EvaluatedLogDensity, p::S) where {T,S}
         # @argcheck length(p) == length(Q.q)
         # new{T,S}(Q, p)
     # end
 end
-
-
-
+@inline Base.pointer(z::PhasePoint) = pointer(z.p)
+@inline StackPointers.StackPointer(z::PhasePoint{P,T,N}) where {P,T,N} = StackPointer(z.Q.∇ℓq.ptr + L*sizeof(T))
 
 #####
 ##### Abstract tree/trajectory interface
@@ -478,8 +525,8 @@ function adjacent_tree(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,T,L}
     i′ = i + (is_forward ? 1 : -1)
     if depth == 0 # moves from z into ζready
         z′ = move(sptr, trajectory, z, is_forward)
-        ζωτ, v, invalid = leaf(trajectory, z′, false)
-        return (ζωτ..., z′, i′), v, (invalid,InvalidTree(i′))
+        (ζ, ω, τ), v, invalid = leaf(trajectory, z′, false)
+        return (ζ, ω, τ, z′, i′), v, (invalid,InvalidTree(i′))
     else
         # “left” tree
         t₋, v₋,(invalid,it) = adjacent_tree(rng, sptr, trajectory, z, i, depth - 1, is_forward)
@@ -487,7 +534,7 @@ function adjacent_tree(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,T,L}
         ζ₋, ω₋, τ₋, z₋, i₋ = t₋
 
         # “right” tree — visited information from left is kept even if invalid
-        sptr_right = StackPointer(pointer(ζ₋) + sizeof(T)*2L)
+        sptr_right = StackPointer(z₋)#ζ₋)
         t₊, v₊,(invalid,it) = adjacent_tree(rng, sptr_right, trajectory, z₋, i₋, depth - 1, is_forward)
         v = combine_visited_statistics(trajectory, v₋, v₊)
         invalid && return t₊, v,(invalid,it)
@@ -498,7 +545,7 @@ function adjacent_tree(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,T,L}
         is_turning(trajectory, τ) && return t₊, v, (true, InvalidTree(i′, i₊))
 
         # valid subtree, combine proposals
-        ζ, ζempty, ω = combine_proposals_and_logweights(rng, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
+        ζ, ω = combine_proposals_and_logweights(rng, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
         (ζ, ω, τ, z₊, i₊), v, (false,REACHED_MAX_DEPTH)
     end
 end
@@ -517,7 +564,7 @@ Return the following values
 - `depth`: the depth of the tree that was sampled from. Doubling steps that lead to an
   invalid adjacent tree do not contribute to `depth`.
 """
-function sample_trajectory(rng, trajectory, z::PtrVector{P,T,L,L}, max_depth::Integer, directions::Directions) where {P,T,L}
+function sample_trajectory(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,T,L}, max_depth::Integer, directions::Directions) where {P,T,L}
 #    @argcheck max_depth ≤ MAX_DIRECTIONS_DEPTH
     (ζ, ω, τ), v, invalid = leaf(trajectory, z, true)
     z₋ = z₊ = z
@@ -527,7 +574,7 @@ function sample_trajectory(rng, trajectory, z::PtrVector{P,T,L,L}, max_depth::In
     while depth < max_depth
         is_forward, directions = next_direction(directions)
         t′, v′, (invalid, it) = adjacent_tree(
-            StackPointer(pointer(ζ) + sizeof(T)*2L), rng, trajectory, (is_forward ? z₊ : z₋), (is_forward ? i₊ : i₋), depth, is_forward
+            StackPointer(ζ), rng, trajectory, (is_forward ? z₊ : z₋), (is_forward ? i₊ : i₋), depth, is_forward
         )
         v = combine_visited_statistics(trajectory, v, v′)
 
@@ -597,22 +644,28 @@ function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVec
     sptr, M⁻¹p
 end
 
-"""
-$(SIGNATURES)
-Calculate the gradient of the logarithm of kinetic energy in momentum `p`.
-"""
-∇kinetic_energy(sptr::StackPointer, κ::GaussianKineticEnergy, p, q = nothing) = calculate_p♯(sptr, κ, p)
+# """
+# $(SIGNATURES)
+# Calculate the gradient of the logarithm of kinetic energy in momentum `p`.
+# """
+# ∇kinetic_energy(sptr::StackPointer, κ::GaussianKineticEnergy, p, q = nothing) = calculate_p♯(sptr, κ, p)
 
 """
 $(SIGNATURES)
 Generate a random momentum from a kinetic energy at position `q`.
 """
-function rand_p(sptr::StackPointer, rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L}
+function rand_p(rng::AbstractRNG, sptr::StackPointer, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L}
     W = κ.W
     sptr, r = PtrVector{P,T,L}(sptr)
     sptr, randn!(rng, r, W)
 end
-
+rand_p!(rng, r::PtrVector{P,T,L,L}, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, r, κ.W)
+function rand_p(rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L}
+    W = κ.W
+    r = randn(rng, size(W,1))
+    r .*= W
+    r
+end
 
 """
 $(SIGNATURES)
@@ -646,8 +699,8 @@ function QuasiNewtonMethods.logdensity(H::Hamiltonian{<:EuclideanKineticEnergy},
     ℓq - (isfinite(K) ? K : oftype(K, Inf))
 end
 
-function calculate_p♯(H::Hamiltonian{<:EuclideanKineticEnergy}, z::PhasePoint)
-    calculate_p♯(H.κ, z.p)
+function calculate_p♯(sptr::StackPointer, H::Hamiltonian{<:EuclideanKineticEnergy}, z::PhasePoint)
+    calculate_p♯(sptr, H.κ, z.p)
 end
 
 """
@@ -660,18 +713,17 @@ return an `-Inf`, making the point divergent.
 """
 function leapfrog(sp::StackPointer,
         H::Hamiltonian{GaussianKineticEnergy{<:Diagonal}},
-        z::PhasePoint{EvaluatedLogDensity{P,T,L}}, ϵ
+        z::PhasePoint{P,T,L}, ϵ
 ) where {P,L,T}
     @unpack ℓ, κ = H
     @unpack p, Q = z
+    @unpack q, ∇ℓq = Q
 #    @argcheck isfinite(Q.ℓq) "Internal error: leapfrog called from non-finite log density"
     sptr = pointer(sp, T)
     B = L*sizeof(T) # counting on this being aligned.
-    pₘ = PtrVector{P,T,L,L}(sptr)
-    q′ = PtrVector{P,T,L,L}(sptr + B) # should this be a new Vector?
+    pₘ = PtrVector{P,T,L,L}(sptr) # sorted third
+    q′ = PtrVector{P,T,L,L}(sptr + B) # sorted first
     M⁻¹ = κ.M⁻¹.diag
-    ∇ℓq = Q.∇ℓq
-    q = Q.q
     @fastmath @inbounds @simd for l ∈ 1:L
         pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
         pₘ[l] = pₘₗ
@@ -679,13 +731,13 @@ function leapfrog(sp::StackPointer,
     end
     # Variables that escape:
     # p′, Q′ (q′, ∇ℓq)
-    sp, Q′ = evaluate_ℓ(sp + 2B, H.ℓ, q′)
+    sp, Q′ = evaluate_ℓ(sp + 2B, H.ℓ, q′) # ∇ℓq is sorted second
     ∇ℓq′ = Q′.∇ℓq
     p′ = pₘ # PtrVector{P,T,L,L}(sptr + 3bytes)
     @fastmath @inbounds @simd for l ∈ 1:L
         p′[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
     end
-    sp + 3B, PhasePoint(Q′, p′)
+    sp, PhasePoint(Q′, p′)
 end
 # function move(sp::StackPointer, trajectory::TrajectoryNUTS, z, fwd)
     # @unpack H, ϵ = trajectory
@@ -851,8 +903,8 @@ A(ϵ) = exp(logdensity(H, leapfrog(H, z, ϵ)) - logdensity(H, z))
 ```
 Note that the ratio is not capped by `1`, so it is not a valid probability *per se*.
 """
-function local_acceptance_ratio(H, z)
-    target = logdensity(H, z)
+function local_acceptance_ratio(sptr, H, z)
+    target = logdensity(sptr, H, z)
     isfinite(target) ||
         throw(DomainError(z.p, "Starting point has non-finite density."))
     ϵ -> exp(logdensity(H, leapfrog(H, z, ϵ)) - target)
@@ -1050,27 +1102,54 @@ combine_visited_statistics(::TrajectoryNUTS, v, w) = combine_acceptance_statisti
 ###
 
 "Statistics for the identification of turning points. See Betancourt (2017, appendix)."
-struct GeneralizedTurnStatistic{T}
-    p♯₋::T
-    p♯₊::T
-    ρ::T
+struct GeneralizedTurnStatistic{D,T,L}
+    p♯₋::PtrVector{D,T,L,L,true}
+    p♯₊::PtrVector{D,T,L,L,true}
+    ρ::PtrVector{D,T,L,L,true}
 end
 
-function leaf_turn_statistic(::Val{:generalized}, H, z)
-    p♯ = calculate_p♯(H, z)
-    GeneralizedTurnStatistic(p♯, p♯, z.p)
+function leaf_turn_statistic(::Val{:generalized}, sptr::StackPointer, H, z)
+    sptr, p♯ = calculate_p♯(sptr, H, z)
+    sptr, GeneralizedTurnStatistic(p♯, p♯, z.p)
 end
 
-function combine_turn_statistics(::TrajectoryNUTS,
-                                 x::GeneralizedTurnStatistic, y::GeneralizedTurnStatistic)
-    GeneralizedTurnStatistic(x.p♯₋, y.p♯₊, x.ρ + y.ρ)
+function combine_turn_statistics(
+    sptr::StackPointer, ::TrajectoryNUTS,
+    x::GeneralizedTurnStatistic{D,T,L}, y::GeneralizedTurnStatistic{D,T,L}
+) where {D,T,L}
+    xρ = x.ρ
+    yρ = y.ρ
+    sptr, ρ = PtrVector{D,T,L,L,true}(sptr)
+    @inbounds @simd for l in 1:L
+        ρ[l] = xρ[l] + yρ[l]
+    end
+    sptr, GeneralizedTurnStatistic(x.p♯₋, y.p♯₊, ρ)
 end
 
-function is_turning(::TrajectoryNUTS, τ::GeneralizedTurnStatistic)
+@generated function is_turning(::TrajectoryNUTS, τ::GeneralizedTurnStatistic{D,T,L}) where {D,T,L}
+    quote
     # Uses the generalized NUTS criterion from Betancourt (2017).
-    @unpack p♯₋, p♯₊, ρ = τ
+        @unpack p♯₋, p♯₊, ρ = τ
     # @argcheck p♯₋ ≢ p♯₊ "internal error: is_turning called on a leaf"
-    dot(p♯₋, ρ) < 0 || dot(p♯₊, ρ) < 0
+        d♯₋ = zero($T)
+        d♯₊ = zero($T)
+        @vvectorize $T 4 for d in 1:$D
+            ρ_d = ρ[d]
+            d♯₋ += ρ_d * p♯₋[d]
+            d♯₊ += ρ_d * p♯₊[d]
+        end
+        # Current version always calculates both dot products; alternative:
+        # dot(p♯₋, ρ) < 0 || dot(p♯₊, ρ) < 0
+        # Calculating both in one loop is faster
+        # ( 2D fma + 3D loads vs 2D fma + 4D loads; at most 2/4 ops/cycle
+        #   can be loads, so the loads cannot keep up with the 2/4 fma/cycle
+        #   and are the bottleneck ),
+        # but it disallows conditional checking to skip second dot product.
+        #
+        # Which is faster on average depends on probability of turning
+        # probability of turning will be fairly low for most models.
+        (d♯₋ < zero($T)) | (d♯₊ < zero($T))
+    end
 end
 
 ###
@@ -1115,10 +1194,9 @@ struct NUTS{S}
     """
     turn_statistic_configuration::S
     function NUTS(; max_depth = DEFAULT_MAX_TREE_DEPTH, min_Δ = -1000.0,
-                  turn_statistic_configuration = Val{:generalized}())
+                  turn_statistic_configuration::S = Val{:generalized}()) where {S}
         # @argcheck 0 < max_depth ≤ MAX_DIRECTIONS_DEPTH
         # @argcheck min_Δ < 0
-        S = typeof(turn_statistic_configuration)
         new{S}(Int(max_depth), Float64(min_Δ), turn_statistic_configuration)
     end
 end
@@ -1152,14 +1230,18 @@ log density position `Q`, using stepsize `ϵ`. Parameters of `algorithm` govern 
 of tree construction.
 Return two values, the new evaluated log density position, and tree statistics.
 """
-function sample_tree(rng, algorithm::NUTS, H::Hamiltonian, Q::EvaluatedLogDensity, ϵ;
-                          p = rand_p(rng, H.κ), directions = rand(rng, Directions))
+function sample_tree(rng, sptr::StackPointer, algorithm::NUTS, H::Hamiltonian, Q::EvaluatedLogDensity, ϵ;
+                          p = nothing, directions = rand(rng, Directions))
+    if p === nothing
+        sptr, _p = rand_p(rng, sptr, H.κ)
+    else
+        _p = p
+    end
     @unpack max_depth, min_Δ, turn_statistic_configuration = algorithm
-    z = PhasePoint(Q, p)
+    z = PhasePoint(Q, _p)
     trajectory = TrajectoryNUTS(H, logdensity(H, z), ϵ, min_Δ, turn_statistic_configuration)
     ζ, v, termination, depth = sample_trajectory(rng, trajectory, z, max_depth, directions)
-    tree_statistics = TreeStatisticsNUTS(logdensity(H, ζ), depth, termination,
-                                         acceptance_rate(v), v.steps, directions)
+    tree_statistics = TreeStatisticsNUTS(logdensity(H, ζ), depth, termination, acceptance_rate(v), v.steps, directions)
     ζ.Q, tree_statistics
 end
 
@@ -1186,7 +1268,7 @@ The second argument can be
 `meta` arguments are key-value pairs.
 In this context, a *step* is a NUTS transition, not a leapfrog step.
 """
-report(reporter::NoProgressReport, step::Union{AbstractString,Integer}; meta...) = nothing
+@inline report(reporter::NoProgressReport, step::Union{AbstractString,Integer}; meta...) = nothing
 
 """
 $(SIGNATURES)
@@ -1194,7 +1276,7 @@ Return a reporter which can be used for progress reports with a known number of
 `total_steps`. May return the same reporter, or a related object. Will display `meta` as
 key-value pairs.
 """
-make_mcmc_reporter(reporter::NoProgressReport, total_steps; meta...) = reporter
+@inline make_mcmc_reporter(reporter::NoProgressReport, total_steps; meta...) = reporter
 
 """
 $(TYPEDEF)
@@ -1309,7 +1391,7 @@ problem which are not changed during warmup.
 # Fields
 $(FIELDS)
 """
-struct SamplingLogDensity{P,R,L<:AbstractProbabilityModel{P},O,S}
+struct SamplingLogDensity{D,R,L<:AbstractProbabilityModel{D},O,S}
     "Random number generator."
     rng::R
     "Log density."
@@ -1337,8 +1419,8 @@ Representation of a warmup state. Not part of the API.
 # Fields
 $(FIELDS)
 """
-struct WarmupState{P,T,L,Tκ <: KineticEnergy, Tϵ <: Union{Real,Nothing}}
-    Q::EvaluatedLogDensity{P,T,L}
+struct WarmupState{D,T,L,Tκ <: KineticEnergy, Tϵ <: Union{Real,Nothing}}
+    Q::EvaluatedLogDensity{D,T,L}
     κ::Tκ
     ϵ::Tϵ
 end
@@ -1359,7 +1441,7 @@ Return the *results* and the *next warmup state* after warming up/adapting accor
 `warmup_stage`, starting from `warmup_state`.
 Use `nothing` for a no-op.
 """
-function warmup(sampling_logdensity::SamplingLogDensity, warmup_stage::Nothing, warmup_state)
+function warmup!(sp, chain, sampling_logdensity::SamplingLogDensity, warmup_stage::Nothing, warmup_state)
     nothing, warmup_state
 end
 
@@ -1423,14 +1505,14 @@ Base.@kwdef struct FindLocalOptimum{T}
 end
 @noinline ThrowOptimizationError(str) = throw(str)
 function warmup!(
-    sp::StackPointer, sample::AbstractMatrix, sampling_logdensity::SamplingLogDensity{D}, local_optimization::FindLocalOptimum, warmup_state
+    sp::StackPointer, chain, sampling_logdensity::SamplingLogDensity{D}, local_optimization::FindLocalOptimum, warmup_state
 ) where {D}
     @unpack ℓ, reporter = sampling_logdensity
     @unpack magnitude_penalty, iterations = local_optimization
     @unpack Q, κ, ϵ = warmup_state
-    @unpack q = Q
+    @unpack q, ℓq, ∇ℓq = Q
     report(reporter, "finding initial optimum")
-    sptr, ℓq = proptimize!(sp, sampling_logdensity.ℓ, q, magnitude_penalty, iterations)
+    ℓq = proptimize!(sp, ℓ, q, ∇ℓq, ℓq, magnitude_penalty, iterations)
     isfinite(ℓq) || ThrowOptimizationError("Optimization failed to converge, returning $ℓq.")
     # fg! = function(F, G, q)
         # ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
@@ -1442,16 +1524,18 @@ function warmup!(
     # objective = NLSolversBase.OnceDifferentiable(NLSolversBase.only_fg!(fg!), q)
     # opt = Optim.optimize(objective, q, Optim.LBFGS(),
                          # Optim.Options(; iterations = iterations))
-    sp, q = PtrVector{D,Float64}(sp)
-    ∇ℓq = PtrVector{D,Float64}(pointer(sp,Float64))
-    sptr, (nothing, WarmupState(EvaluatedLogDensity(q, ℓq, ∇ℓq), κ, ϵ))
+    # sp, q = PtrVector{D,Float64}(sp)
+    # ∇ℓq = PtrVector{D,Float64}(pointer(sp,Float64))
+    # sptr is set ahead by proptimize! to store optim and gradient.
+    nothing, WarmupState(EvaluatedLogDensity(q, ℓq, ∇ℓq), κ, ϵ)
 end
 Base.length(::FindLocalOptimum) = 0
-function warmup!(sp::StackPointer, sample::AbstractMatrix, sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
+function warmup!(sp::StackPointer, chain, sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
     @unpack rng, ℓ, reporter = sampling_logdensity
     @unpack Q, κ, ϵ = warmup_state
     # @argcheck ϵ ≡ nothing "stepsize ϵ manually specified, won't perform initial search"
-    z = PhasePoint(Q, rand_p(rng, κ))
+    sptr, p = rand_p(rng, sp, κ)
+    z = PhasePoint(Q, p)
     ϵ = find_initial_stepsize(stepsize_search, local_acceptance_ratio(Hamiltonian(κ, ℓ), z))
     report(reporter, "found initial stepsize",
            ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
@@ -1514,39 +1598,51 @@ position_matrix(chain) = reduce(hcat, chain)
 
 # sample_M⁻¹(::Type{Symmetric}, chain) = Symmetric(cov(position_matrix(chain); dims = 2))
 
+function store_sample!(_∇ℓq::PtrVector{P,T,L,L}, _q::PtrVector{P,T,L,L}, Q::EvaluatedLogDensity) where {P,T,L,L}
+    @unpack q, ∇ℓq = Q
+    @inbounds for l in 1:L
+        _q[l] = q[l]
+        _∇ℓq[l] = ∇ℓq[l]
+    end
+    EvaluatedLogDensity(
+        _q, Q.ℓq, _∇ℓq
+    )
+end
 
 function warmup!(
-    sp::StackPointer, sample,
+    sp::StackPointer, chain::AbstractMatrix{T},
     sampling_logdensity::SamplingLogDensity{D, <:VectorizedRNG.AbstractPCG},
     tuning::TuningNUTS{Diagonal},
     warmup_state
-) where {D}
+) where {D,T}
     @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
     @unpack Q, κ, ϵ = warmup_state
     @unpack N, stepsize_adaptation, λ = tuning
     L = VectorizationBase.align(D, T)
-    chain = Matrix{typeof(Q.q)}(undef, L, N)
     chain_ptr = pointer(chain)
     tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
     H = Hamiltonian(κ, ℓ)
     ϵ_state = initial_adaptation_state(stepsize_adaptation, ϵ)
     ϵs = Vector{Float64}(undef, N)
     mcmc_reporter = make_mcmc_reporter(reporter, N; tuning = "stepsize and Diagonal{T,PtrVector{}} metric")
-    for i in 1:N
+    # sp, ∇ℓq = PtrVector{D,T}(sp)
+    @unpack ∇ℓq = Q
+    for n in 1:N
         ϵ = current_ϵ(ϵ_state)
-        ϵs[i] = ϵ
-        Q, stats = sample_tree(rng, algorithm, H, Q, ϵ)
-        copyto!( PtrVector{D,T}( chain_ptr ), Q.q ); chain_ptr += L*sizeof(T)
-        tree_statistics[i] = stats
+        ϵs[n] = ϵ
+        Q, stats = sample_tree(rng, sp, algorithm, H, Q, ϵ)
+        Q = store_sample!(∇ℓq, PtrVector{D,T}( chain_ptr ), Q) # relocate to base of stack
+        chain_ptr += L*sizeof(T)
+        tree_statistics[n] = stats
         ϵ_state = adapt_stepsize(stepsize_adaptation, ϵ_state, stats.acceptance_rate)
-        report(mcmc_reporter, i; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
+        report(mcmc_reporter, n; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
     end
     # κ = GaussianKineticEnergy(regularize_M⁻¹(sample_M⁻¹(M, chain), λ))
-    sp, κ = GaussianKineticEnergy(sp, chain, λ, Val{D}())
+    # sp, κ = GaussianKineticEnergy(sp, chain, λ, Val{D}())
+    GaussianKineticEnergy!(κ, chain, λ)
     report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
     
-    ((chain = chain, tree_statistics = tree_statistics, ϵs = ϵs),
-    WarmupState(Q, κ, final_ϵ(ϵ_state)))
+    (chain = chain, tree_statistics = tree_statistics, ϵs = ϵs), WarmupState(Q, κ, final_ϵ(ϵ_state))
 end
 
 function mcmc(sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
@@ -1556,95 +1652,18 @@ end
 function mcmc!(chain::AbstractMatrix, sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
     @unpack rng, ℓ, sampler_options, reporter = sampling_logdensity
     @unpack Q, κ, ϵ = warmup_state
-
+    L = VectorizationBase.align(D, T)
 #    chain = Vector{typeof(Q.q)}(undef, N)
     tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
     H = Hamiltonian(κ, ℓ)
     mcmc_reporter = make_mcmc_reporter(reporter, N)
+    chain_ptr = pointer(chain)
+    # sp, ∇ℓq = PtrVector{D,T}(sp)
+    @unpack ∇ℓq = Q
     for i in 1:N
         Q, tree_statistics[i] = sample_tree(sp, rng, sampler_options, H, Q, ϵ)
-        chain[:,i] .= Q.q
-        
-        report(mcmc_reporter, i)
-    end
-    (chain = chain, tree_statistics = tree_statistics)
-end
-
-
-# """
-# $(SIGNATURES)
-# Adjust the inverse metric estimated from the sample, using an *ad-hoc* shrinkage method.
-# """
-# function regularize_M⁻¹(Σ::Union{Diagonal,Symmetric}, λ::Real)
-    # ad-hoc “shrinkage estimator”
-    # (1 - λ) * Σ + λ * UniformScaling(max(1e-3, median(diag(Σ))))
-# end
-
-# function warmup(sampling_logdensity, tuning::TuningNUTS{M}, warmup_state) where {M}
-    # @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
-    # @unpack Q, κ, ϵ = warmup_state
-    # @unpack N, stepsize_adaptation, λ = tuning
-    # chain = Vector{typeof(Q.q)}(undef, N)
-    # tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
-    # H = Hamiltonian(κ, ℓ)
-    # ϵ_state = initial_adaptation_state(stepsize_adaptation, ϵ)
-    # ϵs = Vector{Float64}(undef, N)
-    # mcmc_reporter = make_mcmc_reporter(reporter, N; tuning = M ≡ Nothing ? "stepsize" :
-                                       # "stepsize and $(M) metric")
-    # for i in 1:N
-        # ϵ = current_ϵ(ϵ_state)
-        # ϵs[i] = ϵ
-        # Q, stats = sample_tree(rng, algorithm, H, Q, ϵ)
-        # chain[i] = Q.q
-        # tree_statistics[i] = stats
-        # ϵ_state = adapt_stepsize(stepsize_adaptation, ϵ_state, stats.acceptance_rate)
-        # report(mcmc_reporter, i; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
-    # end
-    # if M ≢ Nothing
-        # κ = GaussianKineticEnergy(regularize_M⁻¹(sample_M⁻¹(M, chain), λ))
-        # report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
-    # end
-    # ((chain = chain, tree_statistics = tree_statistics, ϵs = ϵs),
-     # WarmupState(Q, κ, final_ϵ(ϵ_state)))
-# end
-
-# """
-# $(SIGNATURES)
-# Markov Chain Monte Carlo for `sampling_logdensity`, with the adapted `warmup_state`.
-# Return a `NamedTuple` of
-# - `chain`, a vector of length `N` that contains the positions,
-# - `tree_statistics`, a vector of length `N` with the tree statistics.
-# """
-# function mcmc(sampling_logdensity, N, warmup_state)
-    # @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
-    # @unpack Q, κ, ϵ = warmup_state
-    # chain = Vector{typeof(Q.q)}(undef, N)
-    # tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
-    # H = Hamiltonian(κ, ℓ)
-    # mcmc_reporter = make_mcmc_reporter(reporter, N)
-    # for i in 1:N
-        # Q, tree_statistics[i] = sample_tree(rng, algorithm, H, Q, ϵ)
-        # chain[i] = Q.q
-        # report(mcmc_reporter, i)
-    # end
-    # (chain = chain, tree_statistics = tree_statistics)
-# end
-
-function mcmc(sampling_logdensity::SamplingLogDensity{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
-    chain = Matrix{eltype(Q.q)}(undef, length(Q.q), N)
-    mcmc!(chain, sampling_logdensity, N, warmup_state, sp)
-end
-function mcmc!(chain::AbstractMatrix, sampling_logdensity::SamplingLogDensity{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
-    @unpack rng, ℓ, sampler_options, reporter = sampling_logdensity
-    @unpack Q, κ, ϵ = warmup_state
-
-#    chain = Vector{typeof(Q.q)}(undef, N)
-    tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
-    H = Hamiltonian(κ, ℓ)
-    mcmc_reporter = make_mcmc_reporter(reporter, N)
-    for i in 1:N
-        Q, tree_statistics[i] = sample_tree(sp, rng, sampler_options, H, Q, ϵ)
-        chain[:,i] .= Q.q
+        Q = store_sample!(∇ℓq, PtrVector{D,T}( chain_ptr ), Q) # relocate to base of stack
+        chain_ptr += L*sizeof(T)
         
         report(mcmc_reporter, i)
     end
@@ -1714,13 +1733,22 @@ Helper function for implementing warmup.
 !!! note
     Changes may imply documentation updates in [`mcmc_keep_warmup`](@ref).
 """
-function _warmup!(sptr, sample, sampling_logdensity, stages, initial_warmup_state)
-    foldl(stages; init = ((), initial_warmup_state)) do acc, stage
-        stages_and_results, warmup_state = acc
-        results, warmup_state′ = warmup!(sptr, sample, sampling_logdensity, stage, warmup_state)
-        stage_information = (stage = stage, results = results, warmup_state = warmup_state′)
-        (stages_and_results..., stage_information), warmup_state′
+@generated function _warmup!(sptr::StackPointer, sample, sampling_logdensity, stages::T, initial_warmup_state) where {T}
+    N = length(T.parameters)
+    q = quote
+        acc_0, stage_0 = (), initial_warmup_state
     end
+    for n in 1:N
+        warmup_call_q = quote
+            ($(Symbol(:stages_and_results_,n-1)), $(Symbol(:warmup_state_,n-1))) = $(Symbol(:acc_,n-1))
+            ($(Symbol(:results_,n)), $(Symbol(:warmup_state′_,n))) = warmup!(sptr, sample, sampling_logdensity, $(Symbol(:stage_,n-1)), $(Symbol(:warmup_state_,n-1)))
+            $(Symbol(:stage_information_,n)) = (stage = $(Symbol(:stage_,n-1)), results = $(Symbol(:results_,n)), warmup_state = $(Symbol(:warmup_state′_,n)))
+            ($(Symbol(:acc_,n)), $(Symbol(:stage_,n))) = ($(Symbol(:stages_and_results_,n-1))..., $(Symbol(:stage_information_,n))), $(Symbol(:warmup_state′_,n))
+        end
+        push!(q.args, warmup_call_q)
+    end
+    push!(q.args, :($(Symbol(:acc_,N)), $(Symbol(:stage_,N))))
+    q
 end
 
 "Shared docstring part for the MCMC API."
@@ -2008,10 +2036,15 @@ stepsizes and momentums `ps`, `N` of which are generated randomly by default.
 function explore_log_acceptance_ratios(ℓ, q, log2ϵs;
                                        rng = Random.GLOBAL_RNG,
                                        κ = GaussianKineticEnergy(dimension(ℓ)),
-                                       N = 20, ps = [rand_p(rng, κ) for _ in 1:N])
+                                       N = 20, ps = nothing)
+    if ps === nothing
+        _ps = [rand_p(rng, κ) for _ in 1:N])
+    else
+        _ps = ps
+    end
     H = Hamiltonian(κ, ℓ)
     Q = evaluate_ℓ(ℓ, q)
-    [log_acceptance_ratio(H, PhasePoint(Q, p), 2.0^log2ϵ) for log2ϵ in log2ϵs, p in ps]
+    [log_acceptance_ratio(H, PhasePoint(Q, p), 2.0^log2ϵ) for log2ϵ in log2ϵs, p in _ps]
 end
 
 """
