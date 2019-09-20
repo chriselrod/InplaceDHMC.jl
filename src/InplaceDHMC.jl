@@ -67,9 +67,9 @@ The inverse covariance ``M⁻¹`` is stored.
 """
 struct GaussianKineticEnergy{P,T,L} <: EuclideanKineticEnergy
     "M⁻¹"
-    M⁻¹::Diagonal{T,PtrVector{P,T,L,L,true}}
+    M⁻¹::Diagonal{T,PtrVector{P,T,L,true}}
     "W such that W*W'=M. Used for generating random draws."
-    W::Diagonal{T,PtrVector{P,T,L,L,true}}
+    W::Diagonal{T,PtrVector{P,T,L,true}}
 end
 
 # """
@@ -82,8 +82,8 @@ end
 $(SIGNATURES)
 Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
 """
-function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,L,true}}) where {P,T,L}
-    sptr, W = PtrVector{P,T,L,L}(sptr)
+function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,true}}) where {P,T,L}
+    sptr, W = PtrVector{P,T,L}(sptr)
     M⁻¹d = M⁻¹.diag
     @fastmath @inbounds @simd for l ∈ 1:L
         W[l] = one(T) / sqrt( M⁻¹d[l] )
@@ -255,12 +255,12 @@ In composite types and arguments, `Q` is usually used for this type.
 """
 struct EvaluatedLogDensity{P,T,L}
     "Position."
-    q::PtrVector{P,T,L,L,true}
+    q::PtrVector{P,T,L,true}
     "ℓ(q). Saved for reuse in sampling."
     ℓq::T
     "∇ℓ(q). Cached for reuse in sampling."
-    ∇ℓq::PtrVector{P,T,L,L,true}
-    function EvaluatedLogDensity(q::PtrVector{P,T,L,L,true}, ℓq::T, ∇ℓq::PtrVector{P,T,L,L,true}) where {P,T<:Real,L}
+    ∇ℓq::PtrVector{P,T,L,true}
+    function EvaluatedLogDensity(q::PtrVector{P,T,L,true}, ℓq::T, ∇ℓq::PtrVector{P,T,L,true}) where {P,T<:Real,L}
 #        @argcheck length(q) == length(∇ℓq)
         new{P,T,L}(q, ℓq, ∇ℓq)
     end
@@ -280,24 +280,19 @@ EvaluatedLogDensity(q, ℓq::Real, ∇ℓq) = EvaluatedLogDensity(collect(q), �
 $(TYPEDEF)
 A point in phase space, consists of a position (in the form of an evaluated log density `ℓ`
 at `q`) and a momentum.
-
-Canonical memory layout:
-p
-Q.q
-Q.∇ℓq
 """
-struct PhasePoint{P,T,N,L}
+struct PhasePoint{P,T,L}
     "Evaluated log density."
     Q::EvaluatedLogDensity{P,T,L}
     "Momentum."
-    p::PtrVector{P,T,N,N,true}
+    p::PtrVector{P,T,L,true}
     # function PhasePoint(Q::EvaluatedLogDensity, p::S) where {T,S}
         # @argcheck length(p) == length(Q.q)
         # new{T,S}(Q, p)
     # end
 end
-@inline Base.pointer(z::PhasePoint) = pointer(z.p)
-@inline StackPointers.StackPointer(z::PhasePoint{P,T,N}) where {P,T,N} = StackPointer(z.Q.∇ℓq.ptr + L*sizeof(T))
+# @inline Base.pointer(z::PhasePoint) = pointer(z.p)
+# @inline StackPointers.StackPointer(z::PhasePoint{P,T,L}) where {P,T,L} = StackPointer(z.Q.∇ℓq.ptr + L*sizeof(T))
 
 #####
 ##### Abstract tree/trajectory interface
@@ -405,19 +400,19 @@ Combine turn statistics with the given direction. When `is_forward`, `τ₁` is 
 otherwise after.
 Internal helper function.
 """
-function combine_turn_statistics_in_direction(trajectory, τ₁, τ₂, is_forward::Bool)
+function combine_turn_statistics_in_direction(tree::Tree, trajectory, τ₁, τ₂, is_forward::Bool)
     if is_forward
-        combine_turn_statistics(trajectory, τ₁, τ₂)
+        combine_turn_statistics(tree, trajectory, τ₁, τ₂)
     else
-        combine_turn_statistics(trajectory, τ₂, τ₁)
+        combine_turn_statistics(tree, trajectory, τ₂, τ₁)
     end
 end
 
-function combine_proposals_and_logweights(rng, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real,
+function combine_proposals_and_logweights(rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real,
                                           is_forward::Bool, is_doubling::Bool)
     ω = logaddexp(ω₁, ω₂)
     logprob2 = calculate_logprob2(trajectory, is_doubling, ω₁, ω₂, ω)
-    ζ = combine_proposals(rng, trajectory, ζ₁, ζ₂, logprob2, is_forward)
+    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward)
     ζ, ω
 end
 
@@ -468,41 +463,82 @@ end
 "Sentinel value for reaching maximum depth."
 const REACHED_MAX_DEPTH = InvalidTree(1, 0)
 
-# topptr(a::Ptr{T}, b::Ptr{T}) where {T} = reinterpret(Ptr{T}, max(reinterpret(UInt, a), reinterpret(UInt, b)))
-
-free_reference!(ptr::Ptr) = free_reference!(reinterpret(Ptr{UInt8}), ptr)
-function free_reference!(ptr::Ptr{UInt8})
-    VectorizationBase.store!( ptr, VectorizationBase.load(ptr) - 0x01 )
-end
-
 # on tree initialization, store
+"""
+Supports a treedepth of up to 31. Code can be modified to support up to 63, but if you're anywhere near 31 you've probably got severe sampling issues.
+The default maximum depth is 10. Runtime is exponential as a function of the depth you're hitting; a depth of 30 will take about a million times longer than 10.
+
+The limit comes from using 32 bits to indicate whether each vector is allocated or not.
+A 1 bit indicates the corresponding space is available; 0 means occupied.
+"""
 struct Tree{D,T,L}
     root::Ptr{T}
-    depth::Int
+    depthp1::Int
+    sptr::StackPointer
 end
+struct FlaggedPhasePoint{D,T,L}
+    z::PhasePoint{D,T,L}
+    flag::UInt32
+end
+struct FlaggedVector{D,T,L} <: PaddedMatrices.AbstractMutableFixedSizePaddedVector{D,T,L}
+    v::PtrVector{D,T,L,true}
+    flag::UInt32
+end
+@inline function FlaggedVector{D,T,L}(ptr::Ptr{T}, flag::UInt32)
+    FlaggedVector{D,T,L}(PtrVector{D,T,L,true}(ptr, flag))
+end
+@inline Base.pointer(v::FlaggedVector) = pointer(v.v.ptr)
 function Tree(sptr::StackPointer, depth::Int, ::PtrVector{D,T,L}) where {D,T,L}
     root = pointer(sptr, T)
     uroot = reinterpret(Ptr{UInt}, root)
-    W = VectorizationBase.pick_vector_width(UInt)
+    # W = VectorizationBase.pick_vector_width(UInt)
+    depthp1 = depth + 1
     # set roots to zero so that all loads can properly be interpreted as bools without further processing on future accesses.
-    SIMDPirates.vstore!(uroot, SIMDPirates.vbroadcast(Vec{W,UInt}, zero(UInt))) 
-    sptr + 2MAX_DIRECTIONS_DEPTH + 4L*(depth+1), Tree{D,T,L}( root, depth )
+    SIMDPirates.vstore!(uroot, SIMDPirates.vbroadcast(Vec{4,UInt32}, 0xffffffff))
+    Tree{D,T,L}( root, depthp1, sptr + VectorizationBase.REGISTER_SIZE + 5L*depthp1 )
 end
-function undefined_phase_point(tree::Tree{D,T,L})
-    @unpack root, depth = tree
+function allocate!(root::Ptr)
+    root32 = reinterpret(Ptr{UInt32}, root) + offset
+    allocations = VectorizationBase.load(root32)
+    first_unallocated = leading_zeros(allocations)
+    flag = 0x80000000 >> first_unallocated
+    VectorizationBase.store!(root32, allocations  ⊻ flag)
+    first_unallocated, flag
+end
+function undefined_z(tree::Tree{D,T,L}) where {D,T,L}
+    @unpack root, depthp1 = tree
     stump = root + VectorizationBase.REGISTER_SIZE
-    i = 0
-    broot = reinterpret(Ptr{Bool}, root)
-    while true
-        VectorizationBase.load(broot) || break
-        
-    end
-     
-end
-function undefined_search_direction(tree::Tree{D,T,L})
 
-end
+    first_unallocated, flag = allocate!(root)
 
+    stump + 3first_unallocated*LT, flag
+end
+function undefined_ρ♯(tree::Tree{D,T,L}) where {D,T,L}
+    @unpack root, depthp1 = tree
+    LT = L*sizeof(T)
+    stump = root + VectorizationBase.REGISTER_SIZE + 3LT*depthp1
+
+    first_unallocated, flag = allocate!(root + 4)
+    
+    FlaggedVector{D,T,L}( stump + first_unallocated*LT, flag )
+end
+function undefined_Σρ(tree::Tree{D,T,L}) where {D,T,L}
+    @unpack root, depthp1 = tree
+    stump = root + VectorizationBase.REGISTER_SIZE + 4L*sizeof(T)*depthp1
+
+    first_unallocated, flag = allocate!(root + 8)
+    
+    FlaggedVector{D,T,L}( stump + first_unallocated*LT, flag )
+end
+function free!(tree::Tree, flag::UInt32, offset::Int)
+    @unpack root = tree
+    root32 = reinterpret(Ptr{UInt32}, root) + offset
+    VectorizationBase.store!(root32, VectorizationBase.load(root32) | flag)
+    nothing
+end
+free_z!(tree::Tree, flag::UInt32) = free!(tree, flag, 0)
+free_ρ♯!(tree::Tree, flag::UInt32) = free!(tree, flag, 4)
+free_Σρ!(tree::Tree, flag::UInt32) = free!(tree, flag, 8)
 
 
 """
@@ -521,31 +557,31 @@ encounteted and invalidated this tree.
     - `i′`: the position of the last node relative to the initial node.
 The *second value* is always the visited node statistic.
 """
-function adjacent_tree(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,T,L}, i, depth, is_forward) where {P,T,L}
+function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::FlaggedPhasePoint{P,T,L}, i, depth, is_forward) where {P,T,L}
+    step = is_forward ? 1 : -1
     i′ = i + (is_forward ? 1 : -1)
     if depth == 0 # moves from z into ζready
-        z′ = move(sptr, trajectory, z, is_forward)
-        (ζ, ω, τ), v, invalid = leaf(trajectory, z′, false)
+        z′ = move(tree, trajectory, z, is_forward)
+        (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z′, false)
         return (ζ, ω, τ, z′, i′), v, (invalid,InvalidTree(i′))
     else
         # “left” tree
-        t₋, v₋,(invalid,it) = adjacent_tree(rng, sptr, trajectory, z, i, depth - 1, is_forward)
+        t₋, v₋, (invalid,it) = adjacent_tree(rng, tree, trajectory, z, i, depth - 1, is_forward)
         invalid && return t₋, v₋, (invalid, it)
         ζ₋, ω₋, τ₋, z₋, i₋ = t₋
 
         # “right” tree — visited information from left is kept even if invalid
-        sptr_right = StackPointer(z₋)#ζ₋)
-        t₊, v₊,(invalid,it) = adjacent_tree(rng, sptr_right, trajectory, z₋, i₋, depth - 1, is_forward)
+        t₊, v₊, (invalid,it) = adjacent_tree(rng, tree, trajectory, z₋, i₋, depth - 1, is_forward)
         v = combine_visited_statistics(trajectory, v₋, v₊)
-        invalid && return t₊, v,(invalid,it)
+        invalid && return t₊, v, (invalid,it)
         ζ₊, ω₊, τ₊, z₊, i₊ = t₊
 
         # turning invalidates
-        τ = combine_turn_statistics_in_direction(trajectory, τ₋, τ₊, is_forward)
+        τ = combine_turn_statistics_in_direction(tree, trajectory, τ₋, τ₊, is_forward)
         is_turning(trajectory, τ) && return t₊, v, (true, InvalidTree(i′, i₊))
 
         # valid subtree, combine proposals
-        ζ, ω = combine_proposals_and_logweights(rng, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
+        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
         (ζ, ω, τ, z₊, i₊), v, (false,REACHED_MAX_DEPTH)
     end
 end
@@ -573,8 +609,8 @@ function sample_trajectory(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,
     i₋ = i₊ = 0
     while depth < max_depth
         is_forward, directions = next_direction(directions)
-        t′, v′, (invalid, it) = adjacent_tree(
-            StackPointer(ζ), rng, trajectory, (is_forward ? z₊ : z₋), (is_forward ? i₊ : i₋), depth, is_forward
+        (ζᵦ, ρ♯ᵦ), t′, v′, (invalid, it) = adjacent_tree(
+            rng, sptr, (ζᵦ, ρ♯ᵦ), trajectory, (is_forward ? z₊ : z₋), (is_forward ? i₊ : i₋), depth, is_forward
         )
         v = combine_visited_statistics(trajectory, v, v′)
 
@@ -592,11 +628,11 @@ function sample_trajectory(rng, sptr::StackPointer, trajectory, z::PhasePoint{P,
         end
 
         # tree has doubled successfully
-        ζ, ω = combine_proposals_and_logweights(rng, trajectory, ζ, ζ′, ω, ω′, is_forward, true)
+        ζ, ω, ζᵦ = combine_proposals_and_logweights(rng, ζᵦ, trajectory, ζ, ζ′, ω, ω′, is_forward, true)
         depth += 1
 
         # when the combined tree is turning, stop
-        τ = combine_turn_statistics_in_direction(trajectory, τ, τ′, is_forward)
+        τ = combine_turn_statistics_in_direction(tree, trajectory, τ, τ′, is_forward)
         is_turning(trajectory, τ) && (termination = InvalidTree(i₋, i₊); break)
     end
     ζ, v, termination, depth
@@ -637,11 +673,19 @@ Return ``p♯ = M⁻¹⋅p``, used for turn diagnostics.
 """
 function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹
-    sptr, M⁻¹p = PtrVector{P,T,L,L}(sptr)
+    sptr, M⁻¹p = PtrVector{P,T,L}(sptr)
     @inbounds @simd for l ∈ 1:L
         M⁻¹p[l] = M⁻¹[l] * p[l]
     end
     sptr, M⁻¹p
+end
+function calculate_p♯(tree::Tree{P,T,L}, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
+    M⁻¹ = κ.M⁻¹
+    M⁻¹p = undefined_ρ♯( tree )
+    @inbounds @simd for l ∈ 1:L
+        M⁻¹p[l] = M⁻¹[l] * p[l]
+    end
+    M⁻¹p
 end
 
 # """
@@ -659,7 +703,7 @@ function rand_p(rng::AbstractRNG, sptr::StackPointer, κ::GaussianKineticEnergy{
     sptr, r = PtrVector{P,T,L}(sptr)
     sptr, randn!(rng, r, W)
 end
-rand_p!(rng, r::PtrVector{P,T,L,L}, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, r, κ.W)
+rand_p!(rng, r::PtrVector{P,T,L}, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, r, κ.W)
 function rand_p(rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L}
     W = κ.W
     r = randn(rng, size(W,1))
@@ -672,8 +716,17 @@ $(SIGNATURES)
 Evaluate log density and gradient and save with the position. Preferred interface for
 creating `EvaluatedLogDensity` instances.
 """
-function evaluate_ℓ(sptr::StackPointer, ℓ::AbstractProbabilityModel{P}, q::PtrVector{P,T,L,L}) where {P,T,L}
-    sptr2, ∇ℓq = PtrVector{P,T,L,L}(sptr)
+function evaluate_ℓ!(sptr::StackPointer, ∇ℓq::PtrVector{P,T,L,true}, ℓ::AbstractProbabilityModel{P}, q::PtrVector{P,T,L,true}) where {P,T,L}
+    ℓq = logdensity_and_gradient!(∇ℓq, ℓ, q, sptr)
+    if isfinite(ℓq)
+        EvaluatedLogDensity(q, ℓq, ∇ℓq)
+    else
+        EvaluatedLogDensity(q, oftype(ℓq, -Inf), q) # second q used just as a placeholder
+    end
+end
+
+function evaluate_ℓ(sptr::StackPointer, ℓ::AbstractProbabilityModel{P}, q::PtrVector{P,T,L}) where {P,T,L}
+    sptr2, ∇ℓq = PtrVector{P,T,L}(sptr)
     ℓq = logdensity_and_gradient!(∇ℓq, ℓ, q, sptr2)
     if isfinite(ℓq)
         sptr2, EvaluatedLogDensity(q, ℓq, ∇ℓq)
@@ -711,6 +764,34 @@ The leapfrog algorithm uses the gradient of the next position to evolve the mome
 this is not finite, the momentum won't be either, `logdensity` above will catch this and
 return an `-Inf`, making the point divergent.
 """
+function leapfrog(tree::Tree{P,T,L},
+        H::Hamiltonian{GaussianKineticEnergy{<:Diagonal}},
+        z::PhasePoint{P,T,L}, ϵ
+) where {P,L,T}
+    @unpack ℓ, κ = H
+    @unpack p, Q = z
+    @unpack q, ∇ℓq = Q
+#    @argcheck isfinite(Q.ℓq) "Internal error: leapfrog called from non-finite log density"
+    treeptr, flag = undefined_z(tree)
+    LT = L*sizeof(T) # counting on this being aligned.
+    pₘ = PtrVector{P,T,L}(treeptr) 
+    q′ = PtrVector{P,T,L}(treeptr + LT)
+    ∇ℓq′ = PtrVector{P,T,L}(treeptr + 2LT) 
+    M⁻¹ = κ.M⁻¹.diag
+    @fastmath @inbounds @simd for l ∈ 1:L
+        pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
+        pₘ[l] = pₘₗ
+        q′[l] = q[l] + ϵ * M⁻¹[l] * pₘₗ
+    end
+    # Variables that escape:
+    # p′, Q′ (q′, ∇ℓq)
+    Q′ = evaluate_ℓ!(tree.sp, ∇ℓq′, H.ℓ, q′) # ∇ℓq is sorted second
+    p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
+    @fastmath @inbounds @simd for l ∈ 1:L
+        p′[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
+    end
+    FlaggedPhasePoint(PhasePoint(Q′, p′), flag)
+end
 function leapfrog(sp::StackPointer,
         H::Hamiltonian{GaussianKineticEnergy{<:Diagonal}},
         z::PhasePoint{P,T,L}, ϵ
@@ -720,9 +801,9 @@ function leapfrog(sp::StackPointer,
     @unpack q, ∇ℓq = Q
 #    @argcheck isfinite(Q.ℓq) "Internal error: leapfrog called from non-finite log density"
     sptr = pointer(sp, T)
-    B = L*sizeof(T) # counting on this being aligned.
-    pₘ = PtrVector{P,T,L,L}(sptr) # sorted third
-    q′ = PtrVector{P,T,L,L}(sptr + B) # sorted first
+    LT = L*sizeof(T) # counting on this being aligned.
+    pₘ = PtrVector{P,T,L}(sptr) 
+    q′ = PtrVector{P,T,L}(sptr + LT)
     M⁻¹ = κ.M⁻¹.diag
     @fastmath @inbounds @simd for l ∈ 1:L
         pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
@@ -731,18 +812,14 @@ function leapfrog(sp::StackPointer,
     end
     # Variables that escape:
     # p′, Q′ (q′, ∇ℓq)
-    sp, Q′ = evaluate_ℓ(sp + 2B, H.ℓ, q′) # ∇ℓq is sorted second
+    sp, Q′ = evaluate_ℓ(sp + 2LT, ∇ℓq′, H.ℓ, q′) # ∇ℓq is sorted second
     ∇ℓq′ = Q′.∇ℓq
-    p′ = pₘ # PtrVector{P,T,L,L}(sptr + 3bytes)
+    p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
     @fastmath @inbounds @simd for l ∈ 1:L
         p′[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
     end
     sp, PhasePoint(Q′, p′)
 end
-# function move(sp::StackPointer, trajectory::TrajectoryNUTS, z, fwd)
-    # @unpack H, ϵ = trajectory
-    # leapfrog(sp, H, z, fwd ? ϵ : -ϵ)
-# end
 
 
 # include("hamiltonian.jl")
@@ -907,7 +984,7 @@ function local_acceptance_ratio(sptr, H, z)
     target = logdensity(sptr, H, z)
     isfinite(target) ||
         throw(DomainError(z.p, "Starting point has non-finite density."))
-    ϵ -> exp(logdensity(H, leapfrog(H, z, ϵ)) - target)
+    ϵ -> exp(logdensity(H, leapfrog(sptr, H, z, ϵ)) - target)
 end
 
 function find_initial_stepsize(parameters::InitialStepsizeSearch, H, z)
@@ -1037,9 +1114,9 @@ struct TrajectoryNUTS{TH,Tf,S}
     turn_statistic_configuration::S
 end
 
-function move(sptr, trajectory::TrajectoryNUTS, z, fwd)
+function move(tree::Tree{D,T,L}, trajectory::TrajectoryNUTS, z::PhasePoint{D,T,L}, fwd::Bool) where {D,T,L}
     @unpack H, ϵ = trajectory
-    leapfrog(sptr, H, z, fwd ? ϵ : -ϵ)
+    leapfrog(tree, H, z, fwd ? ϵ : -ϵ)
 end
 
 ###
@@ -1059,8 +1136,10 @@ function calculate_logprob2(::TrajectoryNUTS, is_doubling, ω₁, ω₂, ω)
     biased_progressive_logprob2(is_doubling, ω₁, ω₂, ω)
 end
 
-function combine_proposals(rng, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward)
-    rand_bool_logprob(rng, logprob2) ? z₂ : z₁
+function combine_proposals(rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward)
+    z, flag = rand_bool_logprob(rng, logprob2) ? (z₂, z₁.flag) : (z₁, z₂.flag)
+    free_z!(tree, flag)
+    z
 end
 
 ###
@@ -1103,27 +1182,41 @@ combine_visited_statistics(::TrajectoryNUTS, v, w) = combine_acceptance_statisti
 
 "Statistics for the identification of turning points. See Betancourt (2017, appendix)."
 struct GeneralizedTurnStatistic{D,T,L}
-    p♯₋::PtrVector{D,T,L,L,true}
-    p♯₊::PtrVector{D,T,L,L,true}
-    ρ::PtrVector{D,T,L,L,true}
+    p♯₋::FlaggedVector{D,T,L}
+    p♯₊::FlaggedVector{D,T,L}
+    ρ::FlaggedVector{D,T,L}
 end
 
-function leaf_turn_statistic(::Val{:generalized}, sptr::StackPointer, H, z)
-    sptr, p♯ = calculate_p♯(sptr, H, z)
-    sptr, GeneralizedTurnStatistic(p♯, p♯, z.p)
+function leaf_turn_statistic(tree::Tree{D,T,L}, ::Val{:generalized}, sptr::StackPointer, H, z::FlaggedPhasePoint{D,T,L}) where {D,T,L}
+    p♯ = calculate_p♯(tree, H, z)
+    GeneralizedTurnStatistic(p♯, p♯, FlaggedVector{D,T,L}(z.z.p, 0x00000000))
 end
 
 function combine_turn_statistics(
-    sptr::StackPointer, ::TrajectoryNUTS,
+    tree::Tree, ::TrajectoryNUTS,
     x::GeneralizedTurnStatistic{D,T,L}, y::GeneralizedTurnStatistic{D,T,L}
 ) where {D,T,L}
     xρ = x.ρ
     yρ = y.ρ
-    sptr, ρ = PtrVector{D,T,L,L,true}(sptr)
+    if xρ.flag == 0x00000000
+        # We are in depth 1; position allocated as part of a PhasePoint, not as part of a turn statistic
+        # Therefore we cannot free either of them, and must allocate a new vector to store the results in.
+        ρ = undefined_Σρ(tree)
+        # Additionally, x.p♯₊ == x.p♯₋ and y.p♯₊ == y.p♯₋, therefore we cannot free them.
+    else # we are at a depth of 2 or greater.
+        # We can therefore reuse a ρ; arbitrarily, we reuse xρ
+        ρ = xρ
+        # and free yρ as well as the two discarded p♯
+        free_Σρ!(tree, yρ.flag)
+        free_ρ♯!(tree, x.p♯₊.flag)
+        free_ρ♯!(tree, y.p♯₋.flag)
+    end
     @inbounds @simd for l in 1:L
         ρ[l] = xρ[l] + yρ[l]
     end
-    sptr, GeneralizedTurnStatistic(x.p♯₋, y.p♯₊, ρ)
+    # x.p♯₊.flag == x.p♯₋.flag || free_ρ♯!(tree, x.p♯₊.flag)
+    # y.p♯₊.flag == y.p♯₋.flag || free_ρ♯!(tree, y.p♯₋.flag)
+    GeneralizedTurnStatistic(x.p♯₋, y.p♯₊, ρ)
 end
 
 @generated function is_turning(::TrajectoryNUTS, τ::GeneralizedTurnStatistic{D,T,L}) where {D,T,L}
@@ -1156,7 +1249,7 @@ end
 ### leafs
 ###
 
-function leaf(trajectory::TrajectoryNUTS, z, is_initial)
+function leaf(tree::Tree, trajectory::TrajectoryNUTS, z, is_initial)
     @unpack H, π₀, min_Δ, turn_statistic_configuration = trajectory
     Δ = is_initial ? zero(π₀) : logdensity(H, z) - π₀
     isdiv = Δ < min_Δ
@@ -1598,7 +1691,7 @@ position_matrix(chain) = reduce(hcat, chain)
 
 # sample_M⁻¹(::Type{Symmetric}, chain) = Symmetric(cov(position_matrix(chain); dims = 2))
 
-function store_sample!(_∇ℓq::PtrVector{P,T,L,L}, _q::PtrVector{P,T,L,L}, Q::EvaluatedLogDensity) where {P,T,L,L}
+function store_sample!(_∇ℓq::PtrVector{P,T,L}, _q::PtrVector{P,T,L}, Q::EvaluatedLogDensity) where {P,T,L,L}
     @unpack q, ∇ℓq = Q
     @inbounds for l in 1:L
         _q[l] = q[l]
@@ -1898,227 +1991,6 @@ end
 
 
 # include("mcmc.jl")
-
-#####
-##### statistics and diagnostics
-#####
-
-module Diagnostics
-
-export EBFMI, summarize_tree_statistics, explore_log_acceptance_ratios, leapfrog_trajectory,
-    InvalidTree, REACHED_MAX_DEPTH, is_divergent
-
-using InplaceDHMC: GaussianKineticEnergy, Hamiltonian, evaluate_ℓ, InvalidTree,
-    REACHED_MAX_DEPTH, is_divergent, log_acceptance_ratio, PhasePoint, rand_p, leapfrog,
-    logdensity, MAX_DIRECTIONS_DEPTH
-
-# using ArgCheck: @argcheck
-using DocStringExtensions: FIELDS, SIGNATURES, TYPEDEF
-using ProbabilityModels: dimension
-using Parameters: @unpack
-import Random
-using Statistics: mean, quantile, var
-
-"""
-$(SIGNATURES)
-Energy Bayesian fraction of missing information. Useful for diagnosing poorly
-chosen kinetic energies.
-Low values (`≤ 0.3`) are considered problematic. See Betancourt (2016).
-"""
-function EBFMI(tree_statistics)
-    πs = map(x -> x.π, tree_statistics)
-    mean(abs2, diff(πs)) / var(πs)
-end
-
-"Acceptance quantiles for [`TreeStatisticsSummary`](@ref) diagnostic summary."
-const ACCEPTANCE_QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-
-"""
-$(TYPEDEF)
-Storing the output of [`NUTS_statistics`](@ref) in a structured way, for pretty
-printing. Currently for internal use.
-# Fields
-$(FIELDS)
-"""
-struct TreeStatisticsSummary{T <: Real, C <: NamedTuple}
-    "Sample length."
-    N::Int
-    "average_acceptance"
-    a_mean::T
-    "acceptance quantiles"
-    a_quantiles::Vector{T}
-    "termination counts"
-    termination_counts::C
-    "depth counts (first element is for `0`)"
-    depth_counts::Vector{Int}
-end
-
-"""
-$(SIGNATURES)
-Count termination reasons in `tree_statistics`.
-"""
-function count_terminations(tree_statistics)
-    max_depth = 0
-    divergence = 0
-    turning = 0
-    for tree_statistic in tree_statistics
-        it = tree_statistic.termination
-        if it == REACHED_MAX_DEPTH
-            max_depth += 1
-        elseif is_divergent(it)
-            divergence += 1
-        else
-            turning += 1
-        end
-    end
-    (max_depth = max_depth, divergence = divergence, turning = turning)
-end
-
-"""
-$(SIGNATURES)
-Count depths in tree statistics.
-"""
-function count_depths(tree_statistics)
-    c = zeros(Int, MAX_DIRECTIONS_DEPTH + 1)
-    for tree_statistic in tree_statistics
-        c[tree_statistic.depth + 1] += 1
-    end
-    c[1:something(findlast(!iszero, c), 0)]
-end
-
-"""
-$(SIGNATURES)
-Summarize tree statistics. Mostly useful for NUTS diagnostics.
-"""
-function summarize_tree_statistics(tree_statistics)
-    As = map(x -> x.acceptance_rate, tree_statistics)
-    TreeStatisticsSummary(length(tree_statistics),
-                          mean(As), quantile(As, ACCEPTANCE_QUANTILES),
-                          count_terminations(tree_statistics),
-                          count_depths(tree_statistics))
-end
-
-function Base.show(io::IO, stats::TreeStatisticsSummary)
-    @unpack N, a_mean, a_quantiles, termination_counts, depth_counts = stats
-    println(io, "Hamiltonian Monte Carlo sample of length $(N)")
-    print(io, "  acceptance rate mean: $(round(a_mean; digits = 2)), 5/25/50/75/95%:")
-    for aq in a_quantiles
-        print(io, " ", round(aq; digits = 2))
-    end
-    println(io)
-    function print_percentages(pairs)
-        is_first = true
-        for (key, value) in sort(collect(pairs), by = first)
-            if is_first
-                is_first = false
-            else
-                print(io, ",")
-            end
-            print(io, " $(key) => $(round(Int, 100*value/N))%")
-        end
-    end
-    print(io, "  termination:")
-    print_percentages(pairs(termination_counts))
-    println(io)
-    print(io, "  depth:")
-    print_percentages(zip(axes(depth_counts, 1) .- 1, depth_counts))
-end
-
-####
-#### Acceptance ratio diagnostics
-####
-
-"""
-$(SIGNATURES)
-From an initial position, calculate the uncapped log acceptance ratio for the given log2
-stepsizes and momentums `ps`, `N` of which are generated randomly by default.
-"""
-function explore_log_acceptance_ratios(ℓ, q, log2ϵs;
-                                       rng = Random.GLOBAL_RNG,
-                                       κ = GaussianKineticEnergy(dimension(ℓ)),
-                                       N = 20, ps = nothing)
-    if ps === nothing
-        _ps = [rand_p(rng, κ) for _ in 1:N])
-    else
-        _ps = ps
-    end
-    H = Hamiltonian(κ, ℓ)
-    Q = evaluate_ℓ(ℓ, q)
-    [log_acceptance_ratio(H, PhasePoint(Q, p), 2.0^log2ϵ) for log2ϵ in log2ϵs, p in _ps]
-end
-
-"""
-$(TYPEDEF)
-Implements an iterator on a leapfrog trajectory until the first non-finite log density.
-# Fields
-$(FIELDS)
-"""
-struct LeapfrogTrajectory{TH,TZ,TF,Tϵ}
-    "Hamiltonian"
-    H::TH
-    "Initial position"
-    z₀::TZ
-    "Negative energy at initial position."
-    π₀::TF
-    "Stepsize (negative: move backward)."
-    ϵ::Tϵ
-end
-
-Base.IteratorSize(::Type{<:LeapfrogTrajectory}) = Base.SizeUnknown()
-
-function Base.iterate(lft::LeapfrogTrajectory, zi = (lft.z₀, 0))
-    @unpack H, ϵ, π₀ = lft
-    z, i = zi
-    if isfinite(z.Q.ℓq)
-        z′ = leapfrog(H, z, ϵ)
-        i′ = i + sign(ϵ)
-        _position_information(lft, z′, i′), (z′, i′)
-    else
-        nothing
-    end
-end
-
-"""
-$(SIGNATURES)
-Position information returned by [`leapfrog_trajectory`](@ref), see documentation there.
-Internal function.
-"""
-function _position_information(lft::LeapfrogTrajectory, z, i)
-    @unpack H, π₀ = lft
-    (z = z, position = i, Δ = logdensity(H, z) - π₀)
-end
-
-"""
-$(SIGNATURES)
-Calculate a leapfrog trajectory visiting `positions` (specified as a `UnitRange`, eg `-5:5`)
-relative to the starting point `q`, with stepsize `ϵ`. `positions` has to contain `0`, and
-the trajectories are only tracked up to the first non-finite log density in each direction.
-Returns a vector of `NamedTuple`s, each containin
-- `z`, a [`PhasePoint`](@ref) object,
-- `position`, the corresponding position,
-- `Δ`, the log density + the kinetic energy relative to position `0`.
-"""
-function leapfrog_trajectory(ℓ, q, ϵ, positions::UnitRange{<:Integer};
-                             rng = Random.GLOBAL_RNG,
-                             κ = GaussianKineticEnergy(dimension(ℓ)), p = rand_p(rng, κ))
-    A, B = first(positions), last(positions)
-    # @argcheck A ≤ 0 ≤ B "Positions has to contain `0`."
-    Q = evaluate_ℓ(ℓ, q)
-    H = Hamiltonian(κ, ℓ)
-    z₀ = PhasePoint(Q, p)
-    π₀ = logdensity(H, z₀)
-    lft_fwd = LeapfrogTrajectory(H, z₀, π₀, ϵ)
-    fwd_part = collect(Iterators.take(lft_fwd, B))
-    bwd_part = collect(Iterators.take(LeapfrogTrajectory(H, z₀, π₀, -ϵ), -A))
-    vcat(reverse!(bwd_part), _position_information(lft_fwd, z₀, 0), fwd_part)
-end
-
-end
-
-# include("diagnostics.jl")
-
-
-
 
 
 end # module
