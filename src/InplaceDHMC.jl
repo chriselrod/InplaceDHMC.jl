@@ -348,9 +348,11 @@ function Tree{D,T,L}(sptr::StackPointer, depth::Int = DEFAULT_MAX_TREE_DEPTH) wh
     root = pointer(sptr, T)
     depth₊ = depth + 2
     # set roots to zero so that all loads can properly be interpreted as bools without further processing on future accesses.
-    SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, root), SIMDPirates.vbroadcast(Vec{4,UInt32}, 0xffffffff))
-    Tree{D,T,L}( root, depth₊, sptr + VectorizationBase.REGISTER_SIZE + 5L*depth₊ )
+    SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, root), (VE(0xffffffff),VE(0xffffffff),VE(0xffffffff),VE(0xffffffff)))
+    Tree{D,T,L}( root, depth₊, sptr + VectorizationBase.REGISTER_SIZE + 6L*sizeof(T)*depth₊ )
 end
+clear!(tree::Tree) = SIMDPirates.vstore!(reinterpret(Ptr{UInt64}, tree.root), (VE(0xffffffffffffffff),VE(0xffffffffffffffff)))
+clear_all_but_z!(tree::Tree, flag::UInt32) = SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, tree.root), (VE(0xffffffff ⊻ flag),VE(0xffffffff),VE(0xffffffff),VE(0xffffffff)))
 
 @generated Tree{D,T}(sptr::StackPointer, depth::Int = DEFAULT_MAX_TREE_DEPTH) where {D,T} = :(Tree{$D,$T,$(VectorizationBase.align(D,T))}(sptr, depth))
 Tree(sptr::StackPointer, depth::Int, ::PtrVector{D,T,L}) where {D,T,L} = Tree{D,T,L}(sptr, dept)
@@ -363,42 +365,54 @@ function allocate!(root::Ptr)
     allocations = VectorizationBase.load(root32)
     first_unallocated = leading_zeros(allocations)
     flag = 0x80000000 >> first_unallocated
-    VectorizationBase.store!(root32, allocations  ⊻ flag)
+    VectorizationBase.store!(root32, allocations ⊻ flag)
     first_unallocated, flag
+end
+function allocate!(tree::Tree, flag::UInt32, i=0)
+    root32 = reinterpret(Ptr{UInt32}, tree.root) + i
+    allocations = VectorizationBase.load(root32)
+    VectorizationBase.store!(root32, allocations ⊻ flag)
+end
+function isallocated(tree::Tree, flag::UInt32, i=0)
+    allocations = VectorizationBase.load(reinterpret(Ptr{UInt32}, tree.root))
+    (allocations | flag) != allocations
 end
 function undefined_z(tree::Tree{D,T,L}) where {D,T,L}
     @unpack root = tree
     LT = aligned_offset(tree)
     stump = root + VectorizationBase.REGISTER_SIZE
     first_unallocated, flag = allocate!(root)
+    # @show first_unallocated, flag
     # @assert first_unallocated < tree.depth
-    # println("Defining z at $first_unallocated")
+    # display(flag)
+    print("Defining z at $first_unallocated with flag "); display(flag)
+    # println("Defining z at $first_unallocated with flag $(bitstring(flag))")
     # first_unallocated < tree.depth || println("Warning, results invalid: Defining z at $first_unallocated")
     # first_unallocated < tree.depth || display(stacktrace())
-    @assert first_unallocated < tree.depth
+    @assert first_unallocated < tree.depth "Don't have space to allocate z!"
     stump + 3first_unallocated*LT, flag
 end
 function undefined_ρ♯(tree::Tree{D,T,L}) where {D,T,L}
     @unpack root, depth = tree
     LT = aligned_offset(tree)
-    stump = root + VectorizationBase.REGISTER_SIZE + 3LT*depth
-    first_unallocated, flag = allocate!(root + 4)    
+    stump = root + VectorizationBase.REGISTER_SIZE + 4LT*depth
+    first_unallocated, flag = allocate!(root + 8)
     # @assert first_unallocated < depth
     # first_unallocated < tree.depth || println("Warning, results invalid: Defining ρ♯ at $first_unallocated")
-    # println("Defining ρ♯ at $first_unallocated")
+    # println("Defining ρ♯ at $first_unallocated with flag $(bitstring(flag))")
     # first_unallocated < tree.depth || display(stacktrace())
-    @assert first_unallocated < depth
+    @assert first_unallocated < (depth<<1) "Don't have space to allocate ρ♯!"
     FlaggedVector{D,T,L}( stump + first_unallocated*LT, flag )
 end
 function undefined_Σρ(tree::Tree{D,T,L}) where {D,T,L}
     @unpack root, depth = tree
     LT = aligned_offset(tree)
-    stump = root + VectorizationBase.REGISTER_SIZE + 4LT*depth
-    first_unallocated, flag = allocate!(root + 8)    
+    stump = root + VectorizationBase.REGISTER_SIZE + 3LT*depth
+    first_unallocated, flag = allocate!(root + 4)
     # @assert first_unallocated < depth
     # first_unallocated < tree.depth || println("Warning, results invalid: Defining Σρ at $first_unallocated")
     # first_unallocated < tree.depth || display(stacktrace())
-    @assert first_unallocated < depth
+    @assert first_unallocated < depth "Don't have space to allocate Σρ!"
     FlaggedVector{D,T,L}( stump + first_unallocated*LT, flag )
 end
 """
@@ -406,14 +420,18 @@ To free, we simply set the bit back to 1 so that it may be allocated again.
 """
 function free!(tree::Tree, flag::UInt32, offset::Int)
     @unpack root = tree
+    # println("Freeing flag $(bitstring(flag)) at offset $offset")
     root32 = reinterpret(Ptr{UInt32}, root) + offset
     VectorizationBase.store!(root32, VectorizationBase.load(root32) | flag)
     nothing
 end
-free_z!(tree::Tree, flag::UInt32) = free!(tree, flag, 0)
-free_ρ♯!(tree::Tree, flag::UInt32) = free!(tree, flag, 4)
-free_Σρ!(tree::Tree, flag::UInt32) = free!(tree, flag, 8)
-# free_z!(tree::Tree, flag::UInt32) = (println("free_z called"); free!(tree, flag, 0))
+# free_z!(tree::Tree, flag::UInt32) = free!(tree, flag, 0)
+free_ρ♯!(tree::Tree, flag::UInt32) = free!(tree, flag, 8)
+free_Σρ!(tree::Tree, flag::UInt32) = free!(tree, flag, 4)
+free_z!(tree::Tree, flag::UInt32) = (print("free z called on flag: "); display(flag); free!(tree, flag, 0))
+# function free_z!(tree::Tree, flag::UInt32)
+
+# end
 # free_ρ♯!(tree::Tree, flag::UInt32) = (println("free ρ♯ called"); free!(tree, flag, 4))
 # free_Σρ!(tree::Tree, flag::UInt32) = (println("free Σρ called"); free!(tree, flag, 8))
 
@@ -535,10 +553,19 @@ function combine_turn_statistics_in_direction(tree::Tree, trajectory, τ₁, τ�
     end
 end
 
-function combine_proposals_and_logweights(rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real,
-                                          is_forward::Bool, is_doubling::Bool)
+function combine_proposals_and_logweights_doubling(
+    rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real, is_forward::Bool, guard::Bool, guard′::Bool
+)
     ω = logaddexp(ω₁, ω₂)
-    logprob2 = calculate_logprob2(trajectory, is_doubling, ω₁, ω₂, ω)
+    logprob2 = calculate_logprob2(trajectory, true, ω₁, ω₂, ω)
+    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward, guard, guard′)
+    ζ, ω
+end
+function combine_proposals_and_logweights(
+    rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real, is_forward::Bool
+)
+    ω = logaddexp(ω₁, ω₂)
+    logprob2 = calculate_logprob2(trajectory, false, ω₁, ω₂, ω)
     ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward)
     ζ, ω
 end
@@ -611,9 +638,14 @@ The *second value* is always the visited node statistic.
 """
 function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L}, i::Int32, depth::Int32, is_forward::Bool) where {P,T,L}
     i′ = i + (is_forward ? one(Int32) : -one(Int32) )
+    # @show (1, bitstring(unsafe_load(reinterpret(Ptr{UInt32}, tree.root), 2)))
+    # @show z.Q.q
     # @show depth, i′
+    lb, ub = 5, 10
+    lb <= abs(i′) < ub && @show z
     if depth == zero(Int32) # moves from z into ζready
         z′ = move(tree, trajectory, z, is_forward)
+        lb <= abs(i′) < ub && @show logdensity(trajectory.H, z′), trajectory.π₀
         (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z′, false)
         return (ζ, ω, τ, z′, i′), v, (invalid,InvalidTree(i′))
     else
@@ -631,12 +663,17 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L},
         ζ₊, ω₊, τ₊, z₊, i₊ = t₊
 
         # turning invalidates
+        # try
+        # @show (2, bitstring(unsafe_load(reinterpret(Ptr{UInt32}, tree.root), 2)))
         τ = combine_turn_statistics_in_direction(tree, trajectory, τ₋, τ₊, is_forward)
+        # catch err
+        #     @show 
+        #     rethrow(err)
         is_turning(trajectory, τ) && return t₊, v, (true, InvalidTree(i′, i₊))
 
         # valid subtree, combine proposals
-        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
-        (ζ, ω, τ, z₊, i₊), v, (false,REACHED_MAX_DEPTH)
+        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward)
+        return (ζ, ω, τ, z₊, i₊), v, (false,REACHED_MAX_DEPTH)
     end
 end
 
@@ -659,18 +696,27 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
     original_flag = zᵢ.flag
     # protect_initial = true # Protect initial position by giving it a dummy flag
     z = PhasePoint(zᵢ.Q, zᵢ.p, 0x00000000)
-    f = b = false
+    @show logdensity(trajectory.H, z), trajectory.π₀
     (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z, true)
     z₋ = z₊ = z
+    # z₋flag = z₊flag = 0x00000000
     depth = zero(Int32)
     termination = REACHED_MAX_DEPTH
     i₋ = i₊ = zero(Int32)
+    # dealloc₋ = dealloc₊ = false
     while depth < max_depth
         is_forward, directions = next_direction(directions)
+        @show depth, is_forward
+        if is_forward
+            zᵢ, iᵢ = z₊, i₊
+        else
+            zᵢ, iᵢ = z₋, i₋
+        end
+        ((ζ.flag === zᵢ) | (z₊.flag === z₋.flag)) || free_z!(tree, zᵢ.flag)
         t′, v′, (invalid, it) = adjacent_tree(
-            rng, tree, trajectory, (is_forward ? z₊ : z₋), (is_forward ? i₊ : i₋), depth, is_forward
+            rng, tree, trajectory, zᵢ, iᵢ, depth, is_forward
         )
-        # @show invalid, it
+        
         v = combine_visited_statistics(trajectory, v, v′)
 
         # invalid adjacent tree: stop
@@ -678,24 +724,30 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
 
         # extract information from adjacent tree
         ζ′, ω′, τ′, z′, i′ = t′
-
+        guard′ = z′.flag === ζ′.flag
+        allocate!(tree, z′.flag)
+        # ζ′g = z′.flag === ζ′.flag ? PhasePoint(ζ′.Q, ζ′.p, 0x00000000) : ζ′
         # update edges and combine proposals
         if is_forward
-            z₊, i₊, f = z′, i′, true
+            z₊, i₊ = z′, i′
+            guard = z₋.flag === ζ.flag
         else
-            z₋, i₋, b = z′, i′, true
+            z₋, i₋ = z′, i′
+            guard = z₊.flag === ζ.flag
         end
 
         # tree has doubled successfully
-        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ, ζ′, ω, ω′, is_forward, true)
+        ζ, ω = combine_proposals_and_logweights_doubling(
+            rng, tree, trajectory, ζ, ζ′, ω, ω′, is_forward, guard, guard′
+        )
         depth += one(Int32)
 
         # when the combined tree is turning, stop
         τ = combine_turn_statistics_in_direction(tree, trajectory, τ, τ′, is_forward)
         is_turning(trajectory, τ) && (termination = InvalidTree(i₋, i₊); break)
     end
-    flag = ζ.flag == 0x00000000 ? original_flag : ζ.flag
-    SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, tree.root), (VE(0xffffffff ⊻ flag),VE(0xffffffff),VE(0xffffffff),VE(0xffffffff)))
+    # @show  original_flag, ζ.flag
+    clear_all_but_z!( tree, ζ.flag == 0x00000000 ? original_flag : ζ.flag )
     ζ, v, termination, depth
 end
 
@@ -778,6 +830,12 @@ creating `EvaluatedLogDensity` instances.
 """
 function evaluate_ℓ!(sptr::StackPointer, ∇ℓq::PtrVector{P,T,L,true}, ℓ::AbstractProbabilityModel{P}, q::PtrVector{P,T,L,true}) where {P,T,L}
     ℓq = logdensity_and_gradient!(∇ℓq, ℓ, q, sptr)
+    sp = reinterpret(Int, pointer(sptr, Float64))
+    dlq = reinterpret(Int, pointer(∇ℓq))
+    dq = reinterpret(Int, pointer(q))
+    # @show sp
+    # @show (sp - dlq) >> 3
+    # @show (sp - dq) >> 3
     if isfinite(ℓq)
         EvaluatedLogDensity(q, ℓq, ∇ℓq)
     else
@@ -832,10 +890,15 @@ function leapfrog(tree::Tree{P,T,L},
     @unpack p, Q = z
     @unpack q, ∇ℓq = Q
 #    @argcheck isfinite(Q.ℓq) "Internal error: leapfrog called from non-finite log density"
+    # @show bitstring(z.flag)
     treeptr, flag = undefined_z(tree)
+    # @show bitstring(flag)
     LT = L*sizeof(T) # counting on this being aligned.
     pₘ = PtrVector{P,T,L}(treeptr) 
     q′ = PtrVector{P,T,L}(treeptr + LT)
+    # @show ϵ
+    # @show z
+    # @show bitstring(z.flag)
     M⁻¹ = κ.M⁻¹.diag
     ϵₕ = T(0.5) * ϵ
     @fastmath @inbounds @simd for l ∈ 1:L
@@ -843,9 +906,11 @@ function leapfrog(tree::Tree{P,T,L},
         pₘ[l] = pₘₗ
         q′[l] = q[l] + ϵ * M⁻¹[l] * pₘₗ
     end
+    # @show q′
     # Variables that escape:
     # p′, Q′ (q′, ∇ℓq)
     Q′ = evaluate_ℓ!(tree.sptr, PtrVector{P,T,L}(treeptr + 2LT), H.ℓ, q′) # ∇ℓq is sorted second
+    # @show Q′.q
     # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ, flag)
     # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
     ∇ℓq′ = Q′.∇ℓq
@@ -1212,6 +1277,13 @@ function combine_proposals(rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logpro
     free_z!(tree, flag)
     z
 end
+function combine_proposals(
+    rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward, guard₁, guard₂
+)
+    z, flag, guard = rand_bool_logprob(rng, logprob2) ? (z₂, z₁.flag, guard₁) : (z₁, z₂.flag, guard₂)
+    guard || free_z!(tree, flag)
+    z
+end
 
 ###
 ### statistics for visited nodes
@@ -1284,6 +1356,7 @@ function combine_turn_statistics(
 ) where {D,T,L}
     ρₓ = x.ρ
     ρʸ = y.ρ
+    # @show x.p♯₊.flag, y.p♯₋.flag
     if ρₓ.flag == 0x00000000
         # We are in depth 1; position allocated as part of a PhasePoint, not as part of a turn statistic
         # Therefore we cannot free either of them, and must allocate a new vector to store the results in.
@@ -1338,10 +1411,14 @@ end
 
 function leaf(tree::Tree, trajectory::TrajectoryNUTS, z, is_initial)
     @unpack H, π₀, min_Δ, turn_statistic_configuration = trajectory
+    # @show logdensity(H, z), π₀
     Δ = is_initial ? zero(π₀) : logdensity(H, z) - π₀
     isdiv = Δ < min_Δ
     v = leaf_acceptance_statistic(Δ, is_initial)
     if isdiv
+        # @show H
+        # @show z
+        # @show typeof(z)
         (z, Δ, dummy_turn_statistic(tree)), v, true
     else
         τ = leaf_turn_statistic(tree, turn_statistic_configuration, H, z)
