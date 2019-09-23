@@ -619,8 +619,8 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L},
     else
         # “left” tree
         t₋, v₋, (invalid,it) = adjacent_tree(rng, tree, trajectory, z, i, depth - one(Int32), is_forward)
-        @show first(t₋)
-        @show t₋[4]
+        # @show first(t₋)
+        # @show t₋[4]
         invalid && return t₋, v₋, (invalid, it)
         ζ₋, ω₋, τ₋, z₋, i₋ = t₋
 
@@ -744,7 +744,7 @@ function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVec
     sptr, M⁻¹p
 end
 function calculate_p♯(tree::Tree{P,T,L}, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
-    M⁻¹ = κ.M⁻¹
+    M⁻¹ = κ.M⁻¹.diag
     M⁻¹p = undefined_ρ♯( tree )
     @inbounds @simd for l ∈ 1:L
         M⁻¹p[l] = M⁻¹[l] * p[l]
@@ -846,6 +846,7 @@ function leapfrog(tree::Tree{P,T,L},
     # Variables that escape:
     # p′, Q′ (q′, ∇ℓq)
     Q′ = evaluate_ℓ!(tree.sptr, PtrVector{P,T,L}(treeptr + 2LT), H.ℓ, q′) # ∇ℓq is sorted second
+    # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ, flag)
     # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
     ∇ℓq′ = Q′.∇ℓq
     @fastmath @inbounds @simd for l ∈ 1:L
@@ -875,12 +876,13 @@ function leapfrog(sp::StackPointer,
     # Variables that escape:
     # p′, Q′ (q′, ∇ℓq)
     sp, Q′ = evaluate_ℓ(sp + 2LT, H.ℓ, q′) # ∇ℓq is sorted second
+    # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ)
     ∇ℓq′ = Q′.∇ℓq
-    p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
+    # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
     @fastmath @inbounds @simd for l ∈ 1:L
-        p′[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
+        pₘ[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
     end
-    sp, PhasePoint(Q′, p′)
+    sp, PhasePoint(Q′, pₘ)
 end
 
 
@@ -1845,10 +1847,10 @@ function warmup!(
     (chain = chain, tree_statistics = tree_statistics, ϵs = ϵs), WarmupState(z, κ, final_ϵ(ϵ_state))
 end
 
-function mcmc(sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
-    chain = Matrix{eltype(Q.q)}(undef, length(Q.q), N)
-    mcmc!(chain, sampling_logdensity, N, warmup_state, sp)
-end
+# function mcmc(sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
+    # chain = Matrix{eltype(Q.q)}(undef, length(Q.q), N)
+    # mcmc!(chain, sampling_logdensity, N, warmup_state, sp)
+# end
 function mcmc!(tree::Tree{D,T,L}, chain::AbstractMatrix, sampling_logdensity::SamplingLogDensity{D}, N, warmup_state) where {D,T,L}
     @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
     @unpack z, κ, ϵ = warmup_state
