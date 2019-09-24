@@ -346,7 +346,7 @@ end
 
 function Tree{D,T,L}(sptr::StackPointer, depth::Int = DEFAULT_MAX_TREE_DEPTH) where {D,T,L}
     root = pointer(sptr, T)
-    depth₊ = depth + 2
+    depth₊ = depth + 3
     # set roots to zero so that all loads can properly be interpreted as bools without further processing on future accesses.
     SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, root), (VE(0xffffffff),VE(0xffffffff),VE(0xffffffff),VE(0xffffffff)))
     Tree{D,T,L}( root, depth₊, sptr + VectorizationBase.REGISTER_SIZE + 6L*sizeof(T)*depth₊ )
@@ -385,7 +385,7 @@ function undefined_z(tree::Tree{D,T,L}) where {D,T,L}
     # @show first_unallocated, flag
     # @assert first_unallocated < tree.depth
     # display(flag)
-    print("Defining z at $first_unallocated with flag "); display(flag)
+    # print("Defining z at $first_unallocated with flag "); display(flag)
     # println("Defining z at $first_unallocated with flag $(bitstring(flag))")
     # first_unallocated < tree.depth || println("Warning, results invalid: Defining z at $first_unallocated")
     # first_unallocated < tree.depth || display(stacktrace())
@@ -421,14 +421,17 @@ To free, we simply set the bit back to 1 so that it may be allocated again.
 function free!(tree::Tree, flag::UInt32, offset::Int)
     @unpack root = tree
     # println("Freeing flag $(bitstring(flag)) at offset $offset")
+    # print("Freeing flag "); display(flag); println(" at offset $offset")
     root32 = reinterpret(Ptr{UInt32}, root) + offset
+    allocated = VectorizationBase.load(root32)
+    flag != 0x00000000 && @assert (allocated | flag) != allocated
     VectorizationBase.store!(root32, VectorizationBase.load(root32) | flag)
     nothing
 end
-# free_z!(tree::Tree, flag::UInt32) = free!(tree, flag, 0)
+free_z!(tree::Tree, flag::UInt32) = free!(tree, flag, 0)
 free_ρ♯!(tree::Tree, flag::UInt32) = free!(tree, flag, 8)
 free_Σρ!(tree::Tree, flag::UInt32) = free!(tree, flag, 4)
-free_z!(tree::Tree, flag::UInt32) = (print("free z called on flag: "); display(flag); free!(tree, flag, 0))
+# free_z!(tree::Tree, flag::UInt32) = (print("free z called on flag: "); display(flag); free!(tree, flag, 0))
 # function free_z!(tree::Tree, flag::UInt32)
 
 # end
@@ -553,22 +556,22 @@ function combine_turn_statistics_in_direction(tree::Tree, trajectory, τ₁, τ�
     end
 end
 
-function combine_proposals_and_logweights_doubling(
-    rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real, is_forward::Bool, guard::Bool, guard′::Bool
-)
-    ω = logaddexp(ω₁, ω₂)
-    logprob2 = calculate_logprob2(trajectory, true, ω₁, ω₂, ω)
-    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward, guard, guard′)
-    ζ, ω
-end
 function combine_proposals_and_logweights(
-    rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real, is_forward::Bool
+    rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real, is_forward::Bool, is_doubling::Bool
 )
     ω = logaddexp(ω₁, ω₂)
-    logprob2 = calculate_logprob2(trajectory, false, ω₁, ω₂, ω)
-    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward)
+    logprob2 = calculate_logprob2(trajectory, is_doubling, ω₁, ω₂, ω)
+    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward, is_doubling)
     ζ, ω
 end
+# function combine_proposals_and_logweights(
+    # rng, tree::Tree, trajectory, ζ₁, ζ₂, ω₁::Real, ω₂::Real, is_forward::Bool
+# )
+    # ω = logaddexp(ω₁, ω₂)
+    # logprob2 = calculate_logprob2(trajectory, false, ω₁, ω₂, ω)
+    # ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward)
+    # ζ, ω
+# end
 
 """
 $(SIGNATURES)
@@ -642,10 +645,10 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L},
     # @show z.Q.q
     # @show depth, i′
     lb, ub = 5, 10
-    lb <= abs(i′) < ub && @show z
+    # lb <= abs(i′) < ub && @show z
     if depth == zero(Int32) # moves from z into ζready
         z′ = move(tree, trajectory, z, is_forward)
-        lb <= abs(i′) < ub && @show logdensity(trajectory.H, z′), trajectory.π₀
+        # lb <= abs(i′) < ub && @show logdensity(trajectory.H, z′), trajectory.π₀
         (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z′, false)
         return (ζ, ω, τ, z′, i′), v, (invalid,InvalidTree(i′))
     else
@@ -672,7 +675,7 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L},
         is_turning(trajectory, τ) && return t₊, v, (true, InvalidTree(i′, i₊))
 
         # valid subtree, combine proposals
-        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward)
+        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
         return (ζ, ω, τ, z₊, i₊), v, (false,REACHED_MAX_DEPTH)
     end
 end
@@ -693,10 +696,11 @@ Return the following values
 """
 function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L}, max_depth::Integer, directions::Directions) where {P,T,L}
     #    @argcheck max_depth ≤ MAX_DIRECTIONS_DEPTH
-    original_flag = zᵢ.flag
+    # original_flag = zᵢ.flag
     # protect_initial = true # Protect initial position by giving it a dummy flag
-    z = PhasePoint(zᵢ.Q, zᵢ.p, 0x00000000)
-    @show logdensity(trajectory.H, z), trajectory.π₀
+    # z = PhasePoint(zᵢ.Q, zᵢ.p, 0x00000000)
+    z = zᵢ
+    # @show logdensity(trajectory.H, z), trajectory.π₀
     (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z, true)
     z₋ = z₊ = z
     # z₋flag = z₊flag = 0x00000000
@@ -706,13 +710,17 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
     # dealloc₋ = dealloc₊ = false
     while depth < max_depth
         is_forward, directions = next_direction(directions)
-        @show depth, is_forward
+        # @show depth, is_forward
         if is_forward
             zᵢ, iᵢ = z₊, i₊
+            alloc = z₋.flag
         else
             zᵢ, iᵢ = z₋, i₋
+            alloc = z₊.flag
         end
-        ((ζ.flag === zᵢ) | (z₊.flag === z₋.flag)) || free_z!(tree, zᵢ.flag)
+        # ((ζ.flag === zᵢ) | (z₊.flag === z₋.flag)) || free_z!(tree, zᵢ.flag)
+        VectorizationBase.store!(reinterpret(Ptr{UInt32}, tree.root), 0xffffffff ⊻ (alloc | ζ.flag))
+        # clear_all_but_z!( tree, alloc | ζ.flag )
         t′, v′, (invalid, it) = adjacent_tree(
             rng, tree, trajectory, zᵢ, iᵢ, depth, is_forward
         )
@@ -730,15 +738,13 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
         # update edges and combine proposals
         if is_forward
             z₊, i₊ = z′, i′
-            guard = z₋.flag === ζ.flag
         else
             z₋, i₋ = z′, i′
-            guard = z₊.flag === ζ.flag
         end
 
         # tree has doubled successfully
-        ζ, ω = combine_proposals_and_logweights_doubling(
-            rng, tree, trajectory, ζ, ζ′, ω, ω′, is_forward, guard, guard′
+        ζ, ω = combine_proposals_and_logweights(
+            rng, tree, trajectory, ζ, ζ′, ω, ω′, is_forward, true
         )
         depth += one(Int32)
 
@@ -747,7 +753,8 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
         is_turning(trajectory, τ) && (termination = InvalidTree(i₋, i₊); break)
     end
     # @show  original_flag, ζ.flag
-    clear_all_but_z!( tree, ζ.flag == 0x00000000 ? original_flag : ζ.flag )
+    # clear_all_but_z!( tree, ζ.flag )# == 0x00000000 ? original_flag : ζ.flag )
+    clear!( tree )
     ζ, v, termination, depth
 end
 
@@ -1272,18 +1279,18 @@ function calculate_logprob2(::TrajectoryNUTS, is_doubling, ω₁, ω₂, ω)
     biased_progressive_logprob2(is_doubling, ω₁, ω₂, ω)
 end
 
-function combine_proposals(rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward)
+function combine_proposals(rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward::Bool, is_doubling::Bool)
     z, flag = rand_bool_logprob(rng, logprob2) ? (z₂, z₁.flag) : (z₁, z₂.flag)
-    free_z!(tree, flag)
+    is_doubling || free_z!(tree, flag)
     z
 end
-function combine_proposals(
-    rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward, guard₁, guard₂
-)
-    z, flag, guard = rand_bool_logprob(rng, logprob2) ? (z₂, z₁.flag, guard₁) : (z₁, z₂.flag, guard₂)
-    guard || free_z!(tree, flag)
-    z
-end
+# function combine_proposals(
+    # rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward, guard₁, guard₂
+# )
+    # z, flag, guard = rand_bool_logprob(rng, logprob2) ? (z₂, z₁.flag, guard₁) : (z₁, z₂.flag, guard₂)
+    # guard || free_z!(tree, flag)
+    # z
+# end
 
 ###
 ### statistics for visited nodes
@@ -1788,9 +1795,9 @@ function warmup!(
     @unpack q, ℓq, ∇ℓq = Q
     report(reporter, "finding initial optimum")
     ℓq = QuasiNewtonMethods.proptimize!(tree.sptr, ℓ, q, ∇ℓq, ℓq, magnitude_penalty, iterations)#+100)
-    @show q
-    @show ℓq
-    @show ∇ℓq
+    # @show q
+    # @show ℓq
+    # @show ∇ℓq
     isfinite(ℓq) || ThrowOptimizationError("Optimization failed to converge, returning $ℓq.")
     # fg! = function(F, G, q)
         # ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
@@ -1906,6 +1913,13 @@ function warmup!(
     # sp, ∇ℓq = PtrVector{D,T}(sp)
     for n in 1:N
         ϵ = current_ϵ(ϵ_state)
+        # @assert ϵ > 1e-10 "Current ϵ: $ϵ; final: $(final_ϵ(ϵ_state))"
+        if ϵ < 1e-10
+            @show z
+            Q = evaluate_ℓ!(tree.sptr, z.Q.∇ℓq, sampling_logdensity.ℓ, z.Q.q)
+            @show Q
+            throw(AssertionError("Current ϵ: $ϵ; final: $(final_ϵ(ϵ_state))"))
+        end
         ϵs[n] = ϵ
         z, stats = sample_tree(rng, tree, algorithm, H, z, ϵ)
         copyto!( PtrVector{D,T}( chain_ptr ), z.Q.q ) # relocate to base of stack
