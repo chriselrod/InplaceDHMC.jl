@@ -1788,17 +1788,22 @@ end
 function warmup!(
     tree::Tree, chain, sampling_logdensity::SamplingLogDensity{D}, local_optimization::FindLocalOptimum, warmup_state
 ) where {D}
-    @unpack ℓ, reporter = sampling_logdensity
+    @unpack rng, ℓ, reporter = sampling_logdensity
     @unpack magnitude_penalty, iterations = local_optimization
     @unpack z, κ, ϵ = warmup_state
     @unpack Q, p, flag = z
     @unpack q, ℓq, ∇ℓq = Q
     report(reporter, "finding initial optimum")
-    ℓq = QuasiNewtonMethods.proptimize!(tree.sptr, ℓ, q, ∇ℓq, ℓq, magnitude_penalty, iterations)#+100)
-    # @show q
-    # @show ℓq
-    # @show ∇ℓq
-    isfinite(ℓq) || ThrowOptimizationError("Optimization failed to converge, returning $ℓq.")
+    for _ in 1:20
+        ℓq = QuasiNewtonMethods.proptimize!(tree.sptr, ℓ, q, ∇ℓq, ℓq, magnitude_penalty, iterations)#+100)
+        # @show q
+        # @show ℓq
+        # @show ∇ℓq
+        isfinite(ℓq) && return nothing, WarmupState(PhasePoint(EvaluatedLogDensity(q, ℓq, ∇ℓq), p, flag), κ, ϵ)
+        random_position!(rng, q)
+        ℓq = evaluate_ℓ!(tree.sptr, ∇ℓq, ℓ, q).ℓq
+    end
+    ThrowOptimizationError("Optimization failed to converge, returning $ℓq.")
     # fg! = function(F, G, q)
         # ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
         # if G ≠ nothing
@@ -1812,7 +1817,6 @@ function warmup!(
     # sp, q = PtrVector{D,Float64}(sp)
     # ∇ℓq = PtrVector{D,Float64}(pointer(sp,Float64))
     # sptr is set ahead by proptimize! to store optim and gradient.
-    nothing, WarmupState(PhasePoint(EvaluatedLogDensity(q, ℓq, ∇ℓq), p, flag), κ, ϵ)
 end
 Base.length(::FindLocalOptimum) = 0
 function warmup!(tree::Tree, chain, sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
