@@ -1537,6 +1537,10 @@ key-value pairs.
 """
 @inline make_mcmc_reporter(reporter::NoProgressReport, total_steps; meta...) = reporter
 
+
+@inline reporting(::NoProgressReport) = false
+@inline reporting(::Any) = true
+
 """
 $(TYPEDEF)
 Report progress into the `Logging` framework, using `@info`.
@@ -1784,7 +1788,8 @@ Base.@kwdef struct FindLocalOptimum{T}
 end
 @noinline ThrowOptimizationError(str) = throw(str)
 function warmup!(
-    tree::Tree, chain, sampling_logdensity::SamplingLogDensity{D}, local_optimization::FindLocalOptimum, warmup_state
+    tree::Tree, chain, tree_statistics, ϵs, sampling_logdensity::SamplingLogDensity{D},
+    local_optimization::FindLocalOptimum, warmup_state
 ) where {D}
     @unpack rng, ℓ, reporter = sampling_logdensity
     @unpack magnitude_penalty, iterations = local_optimization
@@ -1797,7 +1802,7 @@ function warmup!(
         # @show q
         # @show ℓq
         # @show ∇ℓq
-        isfinite(ℓq) && return nothing, WarmupState(PhasePoint(EvaluatedLogDensity(q, ℓq, ∇ℓq), p, flag), κ, ϵ)
+        isfinite(ℓq) && return WarmupState(PhasePoint(EvaluatedLogDensity(q, ℓq, ∇ℓq), p, flag), κ, ϵ)
         random_position!(rng, q)
         ℓq = evaluate_ℓ!(tree.sptr, ∇ℓq, ℓ, q).ℓq
     end
@@ -1817,7 +1822,10 @@ function warmup!(
     # sptr is set ahead by proptimize! to store optim and gradient.
 end
 Base.length(::FindLocalOptimum) = 0
-function warmup!(tree::Tree, chain, sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state)
+function warmup!(
+    tree::Tree, chain, tree_statistics, ϵs,
+    sampling_logdensity, stepsize_search::InitialStepsizeSearch, warmup_state
+)
     @unpack rng, ℓ, reporter = sampling_logdensity
     @unpack z, κ, ϵ = warmup_state
     # @argcheck ϵ ≡ nothing "stepsize ϵ manually specified, won't perform initial search"
@@ -1825,7 +1833,7 @@ function warmup!(tree::Tree, chain, sampling_logdensity, stepsize_search::Initia
     ϵ = find_initial_stepsize(stepsize_search, local_acceptance_ratio(tree.sptr, Hamiltonian(κ, ℓ), z))
     report(reporter, "found initial stepsize",
            ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
-    nothing, WarmupState(z, κ, ϵ)
+    WarmupState(z, κ, ϵ)
 end
 Base.length(::InitialStepsizeSearch) = 0
 """
@@ -1897,6 +1905,7 @@ position_matrix(chain) = reduce(hcat, chain)
 
 function warmup!(
     tree::Tree{D,T,L}, chain₊::AbstractMatrix{T},
+    tree_statistics::AbstractVector{TreeStatisticsNUTS}, ϵs::AbstractVector{T},
     sampling_logdensity::SamplingLogDensity{D},
     tuning::TuningNUTS{M},
     warmup_state
@@ -1907,10 +1916,10 @@ function warmup!(
     # L = VectorizationBase.align(D, T)
     chain_ptr = pointer(chain₊)
     chain = DynamicPtrMatrix{T}(chain_ptr, (D, N), L)
-    tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
+    # tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
     H = Hamiltonian(κ, ℓ)
     ϵ_state = initial_adaptation_state(stepsize_adaptation, ϵ)
-    ϵs = Vector{Float64}(undef, N)
+    # ϵs = Vector{Float64}(undef, N)
     mcmc_reporter = make_mcmc_reporter(reporter, N; tuning = "stepsize and Diagonal{T,PtrVector{}} metric")
     # sp, ∇ℓq = PtrVector{D,T}(sp)
     for n in 1:N
@@ -1929,26 +1938,27 @@ function warmup!(
         chain_ptr += L*sizeof(T)
         tree_statistics[n] = stats
         ϵ_state = adapt_stepsize(stepsize_adaptation, ϵ_state, stats.acceptance_rate)
-        report(mcmc_reporter, n; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
+        reporting(mcmc_reporter) && report(mcmc_reporter, n; ϵ = round(ϵ; sigdigits = REPORT_SIGDIGITS))
     end
     # κ = GaussianKineticEnergy(regularize_M⁻¹(sample_M⁻¹(M, chain), λ))
     # sp, κ = GaussianKineticEnergy(sp, chain, λ, Val{D}())
     if M ≢ Nothing
         GaussianKineticEnergy!(κ, chain, λ)
-        report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
+        reporting(mcmc_reporter) && report(mcmc_reporter, "adaptation finished", adapted_kinetic_energy = κ)
     end
-    (chain = chain, tree_statistics = tree_statistics, ϵs = ϵs), WarmupState(z, κ, final_ϵ(ϵ_state))
+    # (chain = chain, tree_statistics = tree_statistics, ϵs = ϵs)
+    WarmupState(z, κ, final_ϵ(ϵ_state))
 end
 
 # function mcmc(sampling_logdensity::AbstractProbabilityModel{D}, N, warmup_state, sp = STACK_POINTER_REF[]) where {D}
     # chain = Matrix{eltype(Q.q)}(undef, length(Q.q), N)
     # mcmc!(chain, sampling_logdensity, N, warmup_state, sp)
 # end
-function mcmc!(tree::Tree{D,T,L}, chain::AbstractMatrix, sampling_logdensity::SamplingLogDensity{D}, N, warmup_state) where {D,T,L}
+function mcmc!(tree::Tree{D,T,L}, chain::AbstractMatrix, tree_statistics::AbstractVector{TreeStatisticsNUTS}, sampling_logdensity::SamplingLogDensity{D}, N, warmup_state) where {D,T,L}
     @unpack rng, ℓ, algorithm, reporter = sampling_logdensity
     @unpack z, κ, ϵ = warmup_state
 
-    tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
+    # tree_statistics = Vector{TreeStatisticsNUTS}(undef, N)
     H = Hamiltonian(κ, ℓ)
     mcmc_reporter = make_mcmc_reporter(reporter, N)
     chain_ptr = pointer(chain)
@@ -1959,7 +1969,7 @@ function mcmc!(tree::Tree{D,T,L}, chain::AbstractMatrix, sampling_logdensity::Sa
         
         report(mcmc_reporter, n)
     end
-    tree_statistics
+    # tree_statistics
 end
 
 
@@ -2025,22 +2035,16 @@ Helper function for implementing warmup.
 !!! note
     Changes may imply documentation updates in [`mcmc_keep_warmup`](@ref).
 """
-@generated function _warmup!(tree::Tree, chain, sampling_logdensity, stages::T, initial_warmup_state) where {T}
+@generated function _warmup!(tree::Tree, chain, tree_statistics, ϵs, sampling_logdensity, stages::T, warmup_state_0) where {T}
     N = length(T.parameters)
-    q = quote
-        acc_0 = (), initial_warmup_state
-    end
+    q = quote end
     for n in 1:N
         warmup_call_q = quote
-            ($(Symbol(:stages_and_results_,n-1)), $(Symbol(:warmup_state_,n-1))) = $(Symbol(:acc_,n-1))
-            $(Symbol(:stage_,n)) = stages[$n]
-            ($(Symbol(:results_,n)), $(Symbol(:warmup_state′_,n))) = warmup!(tree, chain, sampling_logdensity, $(Symbol(:stage_,n)), $(Symbol(:warmup_state_,n-1)))
-            $(Symbol(:stage_information_,n)) = (stage = $(Symbol(:stage_,n)), results = $(Symbol(:results_,n)), warmup_state = $(Symbol(:warmup_state′_,n)))
-            $(Symbol(:acc_,n)) = ($(Symbol(:stages_and_results_,n-1))..., $(Symbol(:stage_information_,n))), $(Symbol(:warmup_state′_,n))
+            $(Symbol(:warmup_state_,n)) = warmup!(tree, chain, tree_statistics, ϵs, sampling_logdensity, stages[$n], $(Symbol(:warmup_state_,n-1)))
         end
         push!(q.args, warmup_call_q)
     end
-    push!(q.args, Symbol(:acc_,N))
+    push!(q.args, Symbol(:warmup_state_,N))
     q
 end
 
@@ -2066,101 +2070,114 @@ following fields (all of them optional and provided with reasonable defaults):
 $(DOC_INITIAL_WARMUP_ARGS)
 """
 
-"""
-$(SIGNATURES)
-Perform MCMC with NUTS, keeping the warmup results. Returns a `NamedTuple` of
-- `initial_warmup_state`, which contains the initial warmup state
-- `warmup`, an iterable of `NamedTuple`s each containing fields
-    - `stage`: the relevant warmup stage
-    - `results`: results returned by that warmup stage (may be `nothing` if not applicable,
-      or a chain, with tree statistics, etc; see the documentation of stages)
-    - `warmup_state`: the warmup state *after* the corresponding stage.
-- `final_warmup_state`, which contains the final adaptation after all the warmup
-- `inference`, which has `chain` and `tree_statistics`, see [`mcmc_with_warmup`](@ref).
-!!! warning
-    This function is not (yet) exported because the the warmup interface may change with
-    minor versions without being considered breaking. Recommended for interactive use.
-$(DOC_MCMC_ARGS)
-"""
-function mcmc_keep_warmup(rng::AbstractRNG, tree::Tree, ℓ, N::Integer;
-                          initialization = (),
-                          warmup_stages = default_warmup_stages(),
-                          algorithm = NUTS(),
-                          reporter = default_reporter())
-    sampling_logdensity = SamplingLogDensity(rng, ℓ, algorithm, reporter)
-    sptr, initial_warmup_state = initialize_warmup_state(rng, sptr, ℓ; initialization...)
-    warmup, warmup_state = _warmup(sampling_logdensity, warmup_stages, initial_warmup_state)
-    inference = mcmc(sampling_logdensity, N, warmup_state)
-    (initial_warmup_state = initial_warmup_state, warmup = warmup,
-     final_warmup_state = warmup_state, inference = inference)
-end
+# """
+# $(SIGNATURES)
+# Perform MCMC with NUTS, keeping the warmup results. Returns a `NamedTuple` of
+# - `initial_warmup_state`, which contains the initial warmup state
+# - `warmup`, an iterable of `NamedTuple`s each containing fields
+#     - `stage`: the relevant warmup stage
+#     - `results`: results returned by that warmup stage (may be `nothing` if not applicable,
+#       or a chain, with tree statistics, etc; see the documentation of stages)
+#     - `warmup_state`: the warmup state *after* the corresponding stage.
+# - `final_warmup_state`, which contains the final adaptation after all the warmup
+# - `inference`, which has `chain` and `tree_statistics`, see [`mcmc_with_warmup`](@ref).
+# !!! warning
+#     This function is not (yet) exported because the the warmup interface may change with
+#     minor versions without being considered breaking. Recommended for interactive use.
+# $(DOC_MCMC_ARGS)
+# """
+# function mcmc_keep_warmup(rng::AbstractRNG, tree::Tree, ℓ, N::Integer;
+#                           initialization = (),
+#                           warmup_stages = default_warmup_stages(),
+#                           algorithm = NUTS(),
+#                           reporter = default_reporter())
+#     sampling_logdensity = SamplingLogDensity(rng, ℓ, algorithm, reporter)
+#     sptr, initial_warmup_state = initialize_warmup_state(rng, sptr, ℓ; initialization...)
+#     warmup, warmup_state = _warmup(sampling_logdensity, warmup_stages, initial_warmup_state)
+#     inference = mcmc(sampling_logdensity, N, warmup_state)
+#     (initial_warmup_state = initial_warmup_state, warmup = warmup,
+#      final_warmup_state = warmup_state, inference = inference)
+# end
 
-"""
-$(SIGNATURES)
-Perform MCMC with NUTS, including warmup which is not returned. Return a `NamedTuple` of
-- `chain`, a vector of positions from the posterior
-- `tree_statistics`, a vector of tree statistics
-- `κ` and `ϵ`, the adapted metric and stepsize.
-$(DOC_MCMC_ARGS)
-# Usage examples
-Using a fixed stepsize:
-```julia
-mcmc_with_warmup(rng, ℓ, N;
-                 initialization = (ϵ = 0.1, ),
-                 warmup_stages = fixed_stepsize_warmup_stages())
-```
-Starting from a given position `q₀` and kinetic energy scaled down (will still be adapted):
-```julia
-mcmc_with_warmup(rng, ℓ, N;
-                 initialization = (q = q₀, κ = GaussianKineticEnergy(5, 0.1)))
-```
-Using a dense metric:
-```julia
-mcmc_with_warmup(rng, ℓ, N;
-                 warmup_stages = default_warmup_stages(; M = Symmetric))
-```
-Disabling the optimization step:
-```julia
-mcmc_with_warmup(rng, ℓ, N;
-                 warmup_stages = default_warmup_stages(; local_optimization = nothing,
-                                                         M = Symmetric))
-```
-"""
-function mcmc_with_warmup(rng, ℓ, N; initialization = (),
-                          warmup_stages = default_warmup_stages(),
-                          algorithm = NUTS(), reporter = default_reporter())
-    @unpack final_warmup_state, inference =
-        mcmc_keep_warmup(rng, ℓ, N; initialization = initialization,
-                         warmup_stages = warmup_stages, algorithm = algorithm,
-                         reporter = reporter)
-    @unpack κ, ϵ = final_warmup_state
-    (inference..., κ = κ, ϵ = ϵ)
-end
+# """
+# $(SIGNATURES)
+# Perform MCMC with NUTS, including warmup which is not returned. Return a `NamedTuple` of
+# - `chain`, a vector of positions from the posterior
+# - `tree_statistics`, a vector of tree statistics
+# - `κ` and `ϵ`, the adapted metric and stepsize.
+# $(DOC_MCMC_ARGS)
+# # Usage examples
+# Using a fixed stepsize:
+# ```julia
+# mcmc_with_warmup(rng, ℓ, N;
+#                  initialization = (ϵ = 0.1, ),
+#                  warmup_stages = fixed_stepsize_warmup_stages())
+# ```
+# Starting from a given position `q₀` and kinetic energy scaled down (will still be adapted):
+# ```julia
+# mcmc_with_warmup(rng, ℓ, N;
+#                  initialization = (q = q₀, κ = GaussianKineticEnergy(5, 0.1)))
+# ```
+# Using a dense metric:
+# ```julia
+# mcmc_with_warmup(rng, ℓ, N;
+#                  warmup_stages = default_warmup_stages(; M = Symmetric))
+# ```
+# Disabling the optimization step:
+# ```julia
+# mcmc_with_warmup(rng, ℓ, N;
+#                  warmup_stages = default_warmup_stages(; local_optimization = nothing,
+#                                                          M = Symmetric))
+# ```
+# """
+# function mcmc_with_warmup(rng, ℓ, N; initialization = (),
+#                           warmup_stages = default_warmup_stages(),
+#                           algorithm = NUTS(), reporter = default_reporter())
+#     @unpack final_warmup_state, inference =
+#         mcmc_keep_warmup(rng, ℓ, N; initialization = initialization,
+#                          warmup_stages = warmup_stages, algorithm = algorithm,
+#                          reporter = reporter)
+#     @unpack κ, ϵ = final_warmup_state
+#     (inference..., κ = κ, ϵ = ϵ)
+# end
 
 function mcmc_with_warmup!(
-    rng::AbstractRNG, sptr::StackPointer, chain::AbstractMatrix{T}, ℓ::AbstractProbabilityModel{D}, N = size(chain,2);
+    rng::AbstractRNG, sptr::StackPointer, chain::AbstractMatrix{T}, tree_statistics::AbstractVector{T}, ℓ::AbstractProbabilityModel{D}, N = size(chain,2);
     initialization = (), warmup_stages = default_warmup_stages(), algorithm = NUTS(), reporter = default_reporter()
 ) where {D,T}
 
     # We allocate the tree here.
     sampling_logdensity = SamplingLogDensity(rng, ℓ, algorithm, reporter)
+    sptr, ϵs = DynamicPtrVector{Float64}(sptr, maximum(length, warmup_stages))
     tree, initial_warmup_state = initialize_warmup_state(rng, sptr, ℓ; initialization...)
-    warmup, warmup_state = _warmup!(tree, chain, sampling_logdensity, warmup_stages, initial_warmup_state)
-    tree_statistics = mcmc!(tree, chain, sampling_logdensity, N, warmup_state)
-    # (initial_warmup_state = initial_warmup_state, warmup = warmup,
-     # final_warmup_state = warmup_state, inference = inference)
+    warmup_state = _warmup!(tree, chain, tree_statistics, ϵs, sampling_logdensity, warmup_stages, initial_warmup_state)
+    mcmc!(tree, chain, tree_statistics, sampling_logdensity, N, warmup_state)
 
-
-    # @unpack final_warmup_state, inference =
-        # mcmc_keep_warmup(
-            # rng, ℓ, N; initialization = initialization,
-            # warmup_stages = warmup_stages, algorithm = algorithm,
-            # reporter = reporter
-        # )
-    # @unpack κ, ϵ = final_warmup_state
-    # (inference..., κ = κ, ϵ = ϵ)
 end
 
+
+function mcmc_with_warmup(
+    ℓ::AbstractProbabilityModel{D}, N; initialization = (),
+    warmup_stages = default_warmup_stages(),
+    algorithm = NUTS(), reporter = default_reporter()
+) where {D}
+    sptr = ProbabilityModels.STACK_POINTER_REF[]
+    LSS = ProbabilityModels.LOCAL_STACK_SIZE[]
+    nwarmup = maximum(length, warmup_stages)
+
+    NS = max(N, nwarmup)
+    L = VectorizationBase.align(D, Float64)
+    chain = DynamicPaddedMatrix{Float64}(undef, (D, NS), L)
+    tree_statistics = DynamicPaddedVector{TreeStatisticsNUTS}(undef, NS)
+    
+    chain_m = DynamicPtrMatrix{Float64}(pointer(chain), (D, NS), L)
+    tree_statistic = DynamicPtrVector{Float64}(pointer(tree_statistics), NS)
+    mcmc_with_warmup!(
+        first(ProbabilityModels.GLOBAL_PCGs), sptr, chain_m, tree_statistic, ℓ, N;
+        initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter
+    )
+    chain, tree_statistics
+end
 
 function threaded_mcmc(
     ℓ::AbstractProbabilityModel{D}, N; initialization = (),
@@ -2171,21 +2188,25 @@ function threaded_mcmc(
     sptr = ProbabilityModels.STACK_POINTER_REF[]
     LSS = ProbabilityModels.LOCAL_STACK_SIZE[]
     nwarmup = maximum(length, warmup_stages)
+
     NS = max(N,nwarmup)
     L = VectorizationBase.align(D, Float64)
+    NSA = VectorizationBase.align(NSA, Float64)
     chains = DynamicPaddedArray{Float64}(undef, (D, NS, nthreads), L)
+    tree_statistics = DynamicPaddedMatrix{TreeStatisticsNUTS}(undef, (NS, nthreads), NSA + VectorizationBase.CACHELINE_SIZE >> 3)
+
     chain_ptr = pointer(chains)
-    # Threads.@threads
-    for t in 0:nthreads-1
+    stat_ptr = pointer(tree_statistics)
+    
+    Threads.@threads for t in 0:nthreads-1
         chain = DynamicPtrMatrix{Float64}(chain_ptr + t*8NS*L, (D, NS), L)
-        rng =  ProbabilityModels.GLOBAL_PCGs[t+1]
-        mcmc_with_warmup!(rng, sptr + t*LSS, chain, ℓ, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
+        tree_statistic = DynamicPtrVector{Float64}(stat_ptr + t*8NSA, (NS,), NSA)
+        mcmc_with_warmup!(
+            ProbabilityModels.GLOBAL_PCGs[t+1], sptr + t*LSS, chain, tree_statistic, ℓ, N;
+            initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter
+        )
     end
-    chains
-    # @unpack final_warmup_state, inference = mcmc_keep_warmup(
-        # rng, ℓ, N; initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter)
-    # @unpack κ, ϵ = final_warmup_state
-    # (inference..., κ = κ, ϵ = ϵ)
+    chains, tree_statistics
 end
 
 
