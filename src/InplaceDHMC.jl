@@ -383,7 +383,6 @@ function undefined_z(tree::Tree{D,T,L}) where {D,T,L}
     stump = root + VectorizationBase.REGISTER_SIZE
     first_unallocated, flag = allocate!(root)
     # @show first_unallocated, flag
-    # @assert first_unallocated < tree.depth
     # display(flag)
     # print("Defining z at $first_unallocated with flag "); display(flag)
     # println("Defining z at $first_unallocated with flag $(bitstring(flag))")
@@ -424,7 +423,7 @@ function free!(tree::Tree, flag::UInt32, offset::Int)
     # print("Freeing flag "); display(flag); println(" at offset $offset")
     root32 = reinterpret(Ptr{UInt32}, root) + offset
     allocated = VectorizationBase.load(root32)
-    flag != 0x00000000 && @assert (allocated | flag) != allocated
+    flag != 0x00000000 && @assert (allocated | flag) != allocated "Double free!!!!"
     VectorizationBase.store!(root32, VectorizationBase.load(root32) | flag)
     nothing
 end
@@ -561,7 +560,7 @@ function combine_proposals_and_logweights(
 )
     ω = logaddexp(ω₁, ω₂)
     logprob2 = calculate_logprob2(trajectory, is_doubling, ω₁, ω₂, ω)
-    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward, is_doubling)
+    ζ = combine_proposals(rng, tree, trajectory, ζ₁, ζ₂, logprob2, is_forward)#, is_doubling)
     ζ, ω
 end
 # function combine_proposals_and_logweights(
@@ -639,7 +638,7 @@ encounteted and invalidated this tree.
     - `i′`: the position of the last node relative to the initial node.
 The *second value* is always the visited node statistic.
 """
-function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L}, i::Int32, depth::Int32, is_forward::Bool) where {P,T,L}
+function adjacent_tree(rng, tree::Tree{P,T,L}, H, trajectory, z::PhasePoint{P,T,L}, i::Int32, depth::Int32, is_forward::Bool) where {P,T,L}
     i′ = i + (is_forward ? one(Int32) : -one(Int32) )
     # @show (1, bitstring(unsafe_load(reinterpret(Ptr{UInt32}, tree.root), 2)))
     # @show z.Q.q
@@ -647,20 +646,20 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, trajectory, z::PhasePoint{P,T,L},
     lb, ub = 5, 10
     # lb <= abs(i′) < ub && @show z
     if depth == zero(Int32) # moves from z into ζready
-        z′ = move(tree, trajectory, z, is_forward)
+        z′ = move(tree, H, trajectory, z, is_forward)
         # lb <= abs(i′) < ub && @show logdensity(trajectory.H, z′), trajectory.π₀
-        (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z′, false)
+        (ζ, ω, τ), v, invalid = leaf(tree, H, trajectory, z′, false)
         return (ζ, ω, τ, z′, i′), v, (invalid,InvalidTree(i′))
     else
         # “left” tree
-        t₋, v₋, (invalid,it) = adjacent_tree(rng, tree, trajectory, z, i, depth - one(Int32), is_forward)
+        t₋, v₋, (invalid,it) = adjacent_tree(rng, tree, H, trajectory, z, i, depth - one(Int32), is_forward)
         # @show first(t₋)
         # @show t₋[4]
         invalid && return t₋, v₋, (invalid, it)
         ζ₋, ω₋, τ₋, z₋, i₋ = t₋
 
         # “right” tree — visited information from left is kept even if invalid
-        t₊, v₊, (invalid,it) = adjacent_tree(rng, tree, trajectory, z₋, i₋, depth - one(Int32), is_forward)
+        t₊, v₊, (invalid,it) = adjacent_tree(rng, tree, H, trajectory, z₋, i₋, depth - one(Int32), is_forward)
         v = combine_visited_statistics(trajectory, v₋, v₊)
         invalid && return t₊, v, (invalid,it)
         ζ₊, ω₊, τ₊, z₊, i₊ = t₊
@@ -694,14 +693,13 @@ Return the following values
 - `depth`: the depth of the tree that was sampled from. Doubling steps that lead to an
   invalid adjacent tree do not contribute to `depth`.
 """
-function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L}, max_depth::Integer, directions::Directions) where {P,T,L}
+function sample_trajectory(rng, tree::Tree, H, trajectory, z::PhasePoint{P,T,L}, max_depth::Integer, directions::Directions) where {P,T,L}
     #    @argcheck max_depth ≤ MAX_DIRECTIONS_DEPTH
     # original_flag = zᵢ.flag
     # protect_initial = true # Protect initial position by giving it a dummy flag
     # z = PhasePoint(zᵢ.Q, zᵢ.p, 0x00000000)
-    z = zᵢ
     # @show logdensity(trajectory.H, z), trajectory.π₀
-    (ζ, ω, τ), v, invalid = leaf(tree, trajectory, z, true)
+    (ζ, ω, τ), v, invalid = leaf(tree, H, trajectory, z, true)
     z₋ = z₊ = z
     # z₋flag = z₊flag = 0x00000000
     depth = zero(Int32)
@@ -722,7 +720,7 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
         VectorizationBase.store!(reinterpret(Ptr{UInt32}, tree.root), 0xffffffff ⊻ (alloc | ζ.flag))
         # clear_all_but_z!( tree, alloc | ζ.flag )
         t′, v′, (invalid, it) = adjacent_tree(
-            rng, tree, trajectory, zᵢ, iᵢ, depth, is_forward
+            rng, tree, H, trajectory, zᵢ, iᵢ, depth, is_forward
         )
         
         v = combine_visited_statistics(trajectory, v, v′)
@@ -732,8 +730,7 @@ function sample_trajectory(rng, tree::Tree, trajectory, zᵢ::PhasePoint{P,T,L},
 
         # extract information from adjacent tree
         ζ′, ω′, τ′, z′, i′ = t′
-        guard′ = z′.flag === ζ′.flag
-        allocate!(tree, z′.flag)
+        # allocate!(tree, z′.flag)
         # ζ′g = z′.flag === ζ′.flag ? PhasePoint(ζ′.Q, ζ′.p, 0x00000000) : ζ′
         # update edges and combine proposals
         if is_forward
@@ -1244,9 +1241,9 @@ final_ϵ(ϵ::Real) = ϵ
 Representation of a trajectory, ie a Hamiltonian with a discrete integrator that
 also checks for divergence.
 """
-struct TrajectoryNUTS{TH,Tf,S}
-    "Hamiltonian."
-    H::TH
+struct TrajectoryNUTS{Tf,S}
+    # "Hamiltonian."
+    # H::TH
     "Log density of z (negative log energy) at initial point."
     π₀::Tf
     "Stepsize for leapfrog."
@@ -1257,8 +1254,8 @@ struct TrajectoryNUTS{TH,Tf,S}
     turn_statistic_configuration::S
 end
 
-function move(tree::Tree{D,T,L}, trajectory::TrajectoryNUTS, z::PhasePoint{D,T,L}, fwd::Bool) where {D,T,L}
-    @unpack H, ϵ = trajectory
+function move(tree::Tree{D,T,L}, H::Hamiltonian, trajectory::TrajectoryNUTS, z::PhasePoint{D,T,L}, fwd::Bool) where {D,T,L}
+    @unpack ϵ = trajectory
     leapfrog(tree, H, z, fwd ? ϵ : -ϵ)
 end
 
@@ -1279,9 +1276,10 @@ function calculate_logprob2(::TrajectoryNUTS, is_doubling, ω₁, ω₂, ω)
     biased_progressive_logprob2(is_doubling, ω₁, ω₂, ω)
 end
 
-function combine_proposals(rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward::Bool, is_doubling::Bool)
+function combine_proposals(rng, tree::Tree, ::TrajectoryNUTS, z₁, z₂, logprob2::Real, is_forward::Bool)
     z, flag = rand_bool_logprob(rng, logprob2) ? (z₂, z₁.flag) : (z₁, z₂.flag)
-    is_doubling || free_z!(tree, flag)
+    # is_doubling || free_z!(tree, flag)
+    free_z!(tree, flag)
     z
 end
 # function combine_proposals(
@@ -1416,8 +1414,8 @@ end
 ### leafs
 ###
 
-function leaf(tree::Tree, trajectory::TrajectoryNUTS, z, is_initial)
-    @unpack H, π₀, min_Δ, turn_statistic_configuration = trajectory
+function leaf(tree::Tree, H::Hamiltonian, trajectory::TrajectoryNUTS, z, is_initial)
+    @unpack π₀, min_Δ, turn_statistic_configuration = trajectory
     # @show logdensity(H, z), π₀
     Δ = is_initial ? zero(π₀) : logdensity(H, z) - π₀
     isdiv = Δ < min_Δ
@@ -1500,8 +1498,8 @@ function sample_tree(rng, tree::Tree, algorithm::NUTS, H::Hamiltonian, z::PhaseP
         z = PhasePoint(Q, p, flag)
     end
     @unpack max_depth, min_Δ, turn_statistic_configuration = algorithm
-    trajectory = TrajectoryNUTS(H, logdensity(H, z), ϵ, min_Δ, turn_statistic_configuration)
-    ζ, v, termination, depth = sample_trajectory(rng, tree, trajectory, z, max_depth, directions)
+    trajectory = TrajectoryNUTS(logdensity(H, z), ϵ, min_Δ, turn_statistic_configuration)
+    ζ, v, termination, depth = sample_trajectory(rng, tree, H, trajectory, z, max_depth, directions)
     tree_statistics = TreeStatisticsNUTS(logdensity(H, ζ), acceptance_rate(v), termination, depth, v.steps)#, directions)
     ζ, tree_statistics
 end
