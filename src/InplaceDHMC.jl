@@ -25,7 +25,7 @@ using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, Padded
 using QuasiNewtonMethods: AbstractProbabilityModel, dimension, logdensity, logdensity_and_gradient!
 using PaddedMatrices: Static
 # using ProbabilityModels: 
-# using PaddedMatrices: AbstractFixedSizePaddedMatrix
+# using PaddedMatrices: AbstractFixedSizeMatrix
 
 # copy from StatsFuns.jl
 function logaddexp(x, y)
@@ -335,7 +335,7 @@ aligned_offset(::Tree{D,T,L}) where {D,T,L} = L*sizeof(T)
     # z::PhasePoint{D,T,L}
     # flag::UInt32
 # end
-struct FlaggedVector{D,T,L} <: PaddedMatrices.AbstractMutableFixedSizePaddedVector{D,T,L}
+struct FlaggedVector{D,T,L} <: PaddedMatrices.AbstractMutableFixedSizeVector{D,T,L}
     v::PtrVector{D,T,L,true}
     flag::UInt32
 end
@@ -823,8 +823,8 @@ function rand_p(rng::AbstractRNG, sptr::StackPointer, κ::GaussianKineticEnergy{
     sptr, r = PtrVector{P,T,L}(sptr)
     sptr, randn!(rng, r, W)
 end
-rand_p!(rng::VectorizedRNG.AbstractPCG, r::PaddedMatrices.AbstractMutableFixedSizePaddedVector{P,T,L}, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, r, κ.W.diag)
-rand_p(rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, MutableFixedSizePaddedVector{P,T,L}(undef), κ)
+rand_p!(rng::VectorizedRNG.AbstractPCG, r::PaddedMatrices.AbstractMutableFixedSizeVector{P,T,L}, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, r, κ.W.diag)
+rand_p(rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, MutableFixedSizeVector{P,T,L}(undef), κ)
 
 
 """
