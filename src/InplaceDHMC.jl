@@ -67,9 +67,9 @@ The inverse covariance ``M⁻¹`` is stored.
 """
 struct GaussianKineticEnergy{P,T,L} <: EuclideanKineticEnergy
     "M⁻¹"
-    M⁻¹::Diagonal{T,PtrVector{P,T,L,true}}
+    M⁻¹::Diagonal{T,PtrVector{P,T,L,false}}
     "W such that W*W'=M. Used for generating random draws."
-    W::Diagonal{T,PtrVector{P,T,L,true}}
+    W::Diagonal{T,PtrVector{P,T,L,false}}
 end
 
 # """
@@ -82,7 +82,7 @@ end
 $(SIGNATURES)
 Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
 """
-function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,true}}) where {P,T,L}
+function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,false}}) where {P,T,L}
     sptr, W = PtrVector{P,T,L}(sptr)
     M⁻¹d = M⁻¹.diag
     @fastmath @inbounds @simd for l ∈ 1:L
@@ -271,12 +271,12 @@ In composite types and arguments, `Q` is usually used for this type.
 """
 struct EvaluatedLogDensity{P,T,L}
     "Position."
-    q::PtrVector{P,T,L,true}
+    q::PtrVector{P,T,L,false}
     "ℓ(q). Saved for reuse in sampling."
     ℓq::T
     "∇ℓ(q). Cached for reuse in sampling."
-    ∇ℓq::PtrVector{P,T,L,true}
-    function EvaluatedLogDensity(q::PtrVector{P,T,L,true}, ℓq::T, ∇ℓq::PtrVector{P,T,L,true}) where {P,T<:Real,L}
+    ∇ℓq::PtrVector{P,T,L,false}
+    function EvaluatedLogDensity(q::PtrVector{P,T,L,false}, ℓq::T, ∇ℓq::PtrVector{P,T,L,false}) where {P,T<:Real,L}
 #        @argcheck length(q) == length(∇ℓq)
         new{P,T,L}(q, ℓq, ∇ℓq)
     end
@@ -301,7 +301,7 @@ struct PhasePoint{D,T,L}
     "Evaluated log density."
     Q::EvaluatedLogDensity{D,T,L}
     "Momentum."
-    p::PtrVector{D,T,L,true}
+    p::PtrVector{D,T,L,false}
     flag::UInt32
     # function PhasePoint(Q::EvaluatedLogDensity, p::S) where {T,S}
         # @argcheck length(p) == length(Q.q)
@@ -336,11 +336,11 @@ aligned_offset(::Tree{D,T,L}) where {D,T,L} = L*sizeof(T)
     # flag::UInt32
 # end
 struct FlaggedVector{D,T,L} <: PaddedMatrices.AbstractMutableFixedSizeVector{D,T,L}
-    v::PtrVector{D,T,L,true}
+    v::PtrVector{D,T,L,false}
     flag::UInt32
 end
 @inline function FlaggedVector{D,T,L}(ptr::Ptr{T}, flag::UInt32) where {D,T,L}
-    FlaggedVector{D,T,L}(PtrVector{D,T,L,true}(ptr), flag)
+    FlaggedVector{D,T,L}(PtrVector{D,T,L,false}(ptr), flag)
 end
 @inline Base.pointer(v::FlaggedVector) = v.v.ptr
 
@@ -832,7 +832,7 @@ $(SIGNATURES)
 Evaluate log density and gradient and save with the position. Preferred interface for
 creating `EvaluatedLogDensity` instances.
 """
-function evaluate_ℓ!(sptr::StackPointer, ∇ℓq::PtrVector{P,T,L,true}, ℓ::AbstractProbabilityModel{P}, q::PtrVector{P,T,L,true}) where {P,T,L}
+function evaluate_ℓ!(sptr::StackPointer, ∇ℓq::PtrVector{P,T,L,false}, ℓ::AbstractProbabilityModel{P}, q::PtrVector{P,T,L,false}) where {P,T,L}
     ℓq = logdensity_and_gradient!(∇ℓq, ℓ, q, sptr)
     sp = reinterpret(Int, pointer(sptr, Float64))
     dlq = reinterpret(Int, pointer(∇ℓq))
@@ -2142,7 +2142,7 @@ $(DOC_INITIAL_WARMUP_ARGS)
 # end
 
 function mcmc_with_warmup!(
-    rng::AbstractRNG, sptr::StackPointer, chain::AbstractMatrix{T}, tree_statistics::AbstractVector{T}, ℓ::AbstractProbabilityModel{D}, N = size(chain,2);
+    rng::AbstractRNG, sptr::StackPointer, chain::AbstractMatrix{T}, tree_statistics::AbstractVector{TreeStatisticsNUTS}, ℓ::AbstractProbabilityModel{D}, N = size(chain,2);
     initialization = (), warmup_stages = default_warmup_stages(), algorithm = NUTS(), reporter = default_reporter()
 ) where {D,T}
 
@@ -2171,7 +2171,7 @@ function mcmc_with_warmup(
     tree_statistics = DynamicPaddedVector{TreeStatisticsNUTS}(undef, NS)
     
     chain_m = DynamicPtrMatrix{Float64}(pointer(chain), (D, NS), L)
-    tree_statistic = DynamicPtrVector{Float64}(pointer(tree_statistics), NS)
+    tree_statistic = DynamicPtrVector{TreeStatisticsNUTS}(pointer(tree_statistics), NS)
     mcmc_with_warmup!(
         first(ProbabilityModels.GLOBAL_PCGs), sptr, chain_m, tree_statistic, ℓ, N;
         initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter
@@ -2191,16 +2191,17 @@ function threaded_mcmc(
 
     NS = max(N,nwarmup)
     L = VectorizationBase.align(D, Float64)
-    NSA = VectorizationBase.align(NSA, Float64)
+    NSA = VectorizationBase.align(NS, Float64)
     chains = DynamicPaddedArray{Float64}(undef, (D, NS, nthreads), L)
-    tree_statistics = DynamicPaddedMatrix{TreeStatisticsNUTS}(undef, (NS, nthreads), NSA + VectorizationBase.CACHELINE_SIZE >> 3)
+    tree_stride = NSA + VectorizationBase.CACHELINE_SIZE >> 3
+    tree_statistics = DynamicPaddedMatrix{TreeStatisticsNUTS}(undef, (NS, nthreads), tree_stride)
 
     chain_ptr = pointer(chains)
     stat_ptr = pointer(tree_statistics)
     
     Threads.@threads for t in 0:nthreads-1
         chain = DynamicPtrMatrix{Float64}(chain_ptr + t*8NS*L, (D, NS), L)
-        tree_statistic = DynamicPtrVector{Float64}(stat_ptr + t*8NSA, (NS,), NSA)
+        tree_statistic = DynamicPtrVector{TreeStatisticsNUTS}(stat_ptr + t*tree_stride*sizeof(TreeStatisticsNUTS), (NS,), NSA)
         mcmc_with_warmup!(
             ProbabilityModels.GLOBAL_PCGs[t+1], sptr + t*LSS, chain, tree_statistic, ℓ, N;
             initialization = initialization, warmup_stages = warmup_stages, algorithm = algorithm, reporter = reporter
