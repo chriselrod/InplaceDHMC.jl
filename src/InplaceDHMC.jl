@@ -824,7 +824,7 @@ function rand_p(rng::AbstractRNG, sptr::StackPointer, κ::GaussianKineticEnergy{
     sptr, randn!(rng, r, W)
 end
 rand_p!(rng::VectorizedRNG.AbstractPCG, r::PaddedMatrices.AbstractMutableFixedSizeVector{P,T,L}, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, r, κ.W.diag)
-rand_p(rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, MutableFixedSizeVector{P,T,L}(undef), κ)
+rand_p(rng::AbstractRNG, κ::GaussianKineticEnergy{P,T,L}, q = nothing) where {P,T,L} = randn!(rng, FixedSizeVector{P,T,L}(undef), κ)
 
 
 """
