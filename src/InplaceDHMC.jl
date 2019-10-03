@@ -9,7 +9,7 @@ export
     NoProgressReport, LogProgressReport,
     # mcmc
     InitialStepsizeSearch, DualAveraging, FindLocalOptimum,
-    TuningNUTS, mcmc_with_warmup, default_warmup_stages, fixed_stepsize_warmup_stages
+    TuningNUTS, mcmc_with_warmup, threaded_mcmc, default_warmup_stages, fixed_stepsize_warmup_stages
 
 # using ArgCheck: @argcheck
 using DocStringExtensions: FIELDS, FUNCTIONNAME, SIGNATURES, TYPEDEF
@@ -1877,11 +1877,11 @@ end
 
 Base.length(t::TuningNUTS) = t.N
 
-"""
-$(SIGNATURES)
-Form a matrix from positions (`q`), with each column containing a position.
-"""
-position_matrix(chain) = reduce(hcat, chain)
+# """
+# $(SIGNATURES)
+# Form a matrix from positions (`q`), with each column containing a position.
+# """
+# position_matrix(chain) = reduce(hcat, chain)
 
 # """
 # $(SIGNATURES)
@@ -2157,8 +2157,8 @@ end
 
 
 function mcmc_with_warmup(
-    ℓ::AbstractProbabilityModel{D}, N; initialization = (),
-    warmup_stages = default_warmup_stages(),
+    ℓ::AbstractProbabilityModel{D}, N; δ::Float64 = 0.8, initialization = (),
+    warmup_stages = default_warmup_stages(stepsize_adaptation=DualAveraging(δ=δ)),
     algorithm = NUTS(), reporter = default_reporter()
 ) where {D}
     sptr = ProbabilityModels.STACK_POINTER_REF[]
@@ -2180,9 +2180,9 @@ function mcmc_with_warmup(
 end
 
 function threaded_mcmc(
-    ℓ::AbstractProbabilityModel{D}, N; initialization = (),
-    warmup_stages = default_warmup_stages(),
-    algorithm = NUTS(), reporter = default_reporter()
+    ℓ::AbstractProbabilityModel{D}, N; δ::Float64 = 0.8, initialization = (),
+    warmup_stages = default_warmup_stages(stepsize_adaptation=DualAveraging(δ=δ)),
+    algorithm = NUTS(), reporter = NoProgressReport()#default_reporter()
 ) where {D}
     nthreads = ProbabilityModels.NTHREADS[]
     sptr = ProbabilityModels.STACK_POINTER_REF[]
