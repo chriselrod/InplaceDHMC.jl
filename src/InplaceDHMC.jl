@@ -1926,9 +1926,9 @@ function warmup!(
         ϵ = current_ϵ(ϵ_state)
         # @assert ϵ > 1e-10 "Current ϵ: $ϵ; final: $(final_ϵ(ϵ_state))"
         if ϵ < 1e-10
-            @show z
+            @show Threads.threadid(), z
             Q = evaluate_ℓ!(tree.sptr, z.Q.∇ℓq, sampling_logdensity.ℓ, z.Q.q)
-            @show Q
+            @show Threads.threadid(), Q
             throw(AssertionError("Current ϵ: $ϵ; final: $(final_ϵ(ϵ_state))"))
         end
         ϵs[n] = ϵ
