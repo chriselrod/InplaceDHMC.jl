@@ -652,14 +652,18 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, H, trajectory, z::PhasePoint{P,T,
         return (ζ, ω, τ, z′, i′), v, (invalid,InvalidTree(i′))
     else
         # “left” tree
-        t₋, v₋, (invalid,it) = adjacent_tree(rng, tree, H, trajectory, z, i, depth - one(Int32), is_forward)
+        t₋, v₋, (invalid,it) = adjacent_tree(
+            rng, tree, H, trajectory, z, i, depth - one(Int32), is_forward
+        )
         # @show first(t₋)
         # @show t₋[4]
         invalid && return t₋, v₋, (invalid, it)
         ζ₋, ω₋, τ₋, z₋, i₋ = t₋
 
         # “right” tree — visited information from left is kept even if invalid
-        t₊, v₊, (invalid,it) = adjacent_tree(rng, tree, H, trajectory, z₋, i₋, depth - one(Int32), is_forward)
+        t₊, v₊, (invalid,it) = adjacent_tree(
+            rng, tree, H, trajectory, z₋, i₋, depth - one(Int32), is_forward
+        )
         v = combine_visited_statistics(trajectory, v₋, v₊)
         invalid && return t₊, v, (invalid,it)
         ζ₊, ω₊, τ₊, z₊, i₊ = t₊
@@ -674,7 +678,9 @@ function adjacent_tree(rng, tree::Tree{P,T,L}, H, trajectory, z::PhasePoint{P,T,
         is_turning(trajectory, τ) && return t₊, v, (true, InvalidTree(i′, i₊))
 
         # valid subtree, combine proposals
-        ζ, ω = combine_proposals_and_logweights(rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false)
+        ζ, ω = combine_proposals_and_logweights(
+            rng, tree, trajectory, ζ₋, ζ₊, ω₋, ω₊, is_forward, false
+        )
         return (ζ, ω, τ, z₊, i₊), v, (false,REACHED_MAX_DEPTH)
     end
 end
@@ -717,7 +723,9 @@ function sample_trajectory(rng, tree::Tree, H, trajectory, z::PhasePoint{P,T,L},
             alloc = z₊.flag
         end
         # ((ζ.flag === zᵢ) | (z₊.flag === z₋.flag)) || free_z!(tree, zᵢ.flag)
-        VectorizationBase.store!(reinterpret(Ptr{UInt32}, tree.root), 0xffffffff ⊻ (alloc | ζ.flag))
+        VectorizationBase.store!(
+            reinterpret(Ptr{UInt32}, tree.root), 0xffffffff ⊻ (alloc | ζ.flag)
+        )
         # clear_all_but_z!( tree, alloc | ζ.flag )
         t′, v′, (invalid, it) = adjacent_tree(
             rng, tree, H, trajectory, zᵢ, iᵢ, depth, is_forward
@@ -2182,9 +2190,9 @@ end
 function threaded_mcmc(
     ℓ::AbstractProbabilityModel{D}, N; δ::Float64 = 0.8, initialization = (),
     warmup_stages = default_warmup_stages(stepsize_adaptation=DualAveraging(δ=δ)),
-    algorithm = NUTS(), reporter = NoProgressReport()#default_reporter()
+    algorithm = NUTS(), reporter = NoProgressReport(),
+    nchains = ProbabilityModels.NTHREADS[]
 ) where {D}
-    nthreads = ProbabilityModels.NTHREADS[]
     sptr = ProbabilityModels.STACK_POINTER_REF[]
     LSS = ProbabilityModels.LOCAL_STACK_SIZE[]
     nwarmup = maximum(length, warmup_stages)
@@ -2192,14 +2200,14 @@ function threaded_mcmc(
     NS = max(N,nwarmup)
     L = VectorizationBase.align(D, Float64)
     NSA = VectorizationBase.align(NS, Float64)
-    chains = DynamicPaddedArray{Float64}(undef, (D, NS, nthreads), L)
+    chains = DynamicPaddedArray{Float64}(undef, (D, NS, nchains), L)
     tree_stride = NSA + VectorizationBase.CACHELINE_SIZE >> 3
-    tree_statistics = DynamicPaddedMatrix{TreeStatisticsNUTS}(undef, (NS, nthreads), tree_stride)
+    tree_statistics = DynamicPaddedMatrix{TreeStatisticsNUTS}(undef, (NS, nchains), tree_stride)
 
     chain_ptr = pointer(chains)
     stat_ptr = pointer(tree_statistics)
     
-    Threads.@threads for t in 0:nthreads-1
+    Threads.@threads for t in 0:nchains-1
         chain = DynamicPtrMatrix{Float64}(chain_ptr + t*8NS*L, (D, NS), L)
         tree_statistic = DynamicPtrVector{TreeStatisticsNUTS}(stat_ptr + t*tree_stride*sizeof(TreeStatisticsNUTS), (NS,), NSA)
         mcmc_with_warmup!(
