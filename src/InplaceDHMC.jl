@@ -1805,7 +1805,7 @@ function warmup!(
     @unpack Q, p, flag = z
     @unpack q, ℓq, ∇ℓq = Q
     report(reporter, "finding initial optimum")
-    for _ in 1:20
+    for _ in 1:100
         ℓq = QuasiNewtonMethods.proptimize!(tree.sptr, ℓ, q, ∇ℓq, ℓq, magnitude_penalty, iterations)#+100)
         # @show q
         # @show ℓq
@@ -1814,7 +1814,7 @@ function warmup!(
         random_position!(rng, q)
         ℓq = evaluate_ℓ!(tree.sptr, ∇ℓq, ℓ, q).ℓq
     end
-    ThrowOptimizationError("Optimization failed to converge, returning $ℓq.")
+    ThrowOptimizationError("Optimization failed to converge, returning $ℓq; Thrad ID: $(Threads.threadid()).")
     # fg! = function(F, G, q)
         # ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
         # if G ≠ nothing
@@ -2169,10 +2169,8 @@ function mcmc_with_warmup(
     warmup_stages = default_warmup_stages(stepsize_adaptation=DualAveraging(δ=δ)),
     algorithm = NUTS(), reporter = default_reporter()
 ) where {D}
-    sptr = ProbabilityModels.STACK_POINTER_REF[]
-    LSS = ProbabilityModels.LOCAL_STACK_SIZE[]
+    sptr = stackpointer()
     nwarmup = maximum(length, warmup_stages)
-
     NS = max(N, nwarmup)
     L = VectorizationBase.align(D, Float64)
     chain = DynamicPaddedMatrix{Float64}(undef, (D, NS), L)
