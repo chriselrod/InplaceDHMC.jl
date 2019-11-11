@@ -85,7 +85,7 @@ Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
 function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,false}}) where {P,T,L}
     sptr, W = PtrVector{P,T,L}(sptr)
     M⁻¹d = M⁻¹.diag
-    @fastmath @inbounds @simd for l ∈ 1:L
+    @fastmath @inbounds @simd ivdep for l ∈ 1:L
         W[l] = one(T) / sqrt( M⁻¹d[l] )
     end
     sptr, GaussianKineticEnergy(M⁻¹, Diagonal( W ))
@@ -785,7 +785,7 @@ Return kinetic energy `κ`, at momentum `p`.
         # @show M⁻¹
         # @show p
         ke = zero(T)
-        # @vvectorize instead of @simd for the masked reduction
+        # @vvectorize instead of @simd ivdep for the masked reduction
         @vvectorize_unsafe $T 4 for d ∈ 1:$D # these are PtrVector already; GC preservation must happen elsewhere
             pᵈ = p[d]
             ke += pᵈ * M⁻¹[d] * pᵈ
@@ -802,7 +802,7 @@ Return ``p♯ = M⁻¹⋅p``, used for turn diagnostics.
 function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹
     sptr, M⁻¹p = PtrVector{P,T,L}(sptr)
-    @inbounds @simd for l ∈ 1:L
+    @inbounds @simd ivdep for l ∈ 1:L
         M⁻¹p[l] = M⁻¹[l] * p[l]
     end
     sptr, M⁻¹p
@@ -810,7 +810,7 @@ end
 function calculate_p♯(tree::Tree{P,T,L}, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹.diag
     M⁻¹p = undefined_ρ♯( tree )
-    @inbounds @simd for l ∈ 1:L
+    @inbounds @simd ivdep for l ∈ 1:L
         M⁻¹p[l] = M⁻¹[l] * p[l]
     end
     M⁻¹p
@@ -913,7 +913,7 @@ function leapfrog(tree::Tree{P,T,L},
     # @show bitstring(z.flag)
     M⁻¹ = κ.M⁻¹.diag
     ϵₕ = T(0.5) * ϵ
-    @fastmath @inbounds @simd for l ∈ 1:L
+    @fastmath @inbounds @simd ivdep for l ∈ 1:L
         pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
         pₘ[l] = pₘₗ
         q′[l] = q[l] + ϵ * M⁻¹[l] * pₘₗ
@@ -926,7 +926,7 @@ function leapfrog(tree::Tree{P,T,L},
     # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ, flag)
     # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
     ∇ℓq′ = Q′.∇ℓq
-    @fastmath @inbounds @simd for l ∈ 1:L
+    @fastmath @inbounds @simd ivdep for l ∈ 1:L
         pₘ[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
     end
     PhasePoint(Q′, pₘ, flag)
@@ -945,7 +945,7 @@ function leapfrog(sp::StackPointer,
     q′ = PtrVector{P,T,L}(sptr + LT)
     M⁻¹ = κ.M⁻¹.diag
     ϵₕ = T(0.5) * ϵ
-    @fastmath @inbounds @simd for l ∈ 1:L
+    @fastmath @inbounds @simd ivdep for l ∈ 1:L
         pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
         pₘ[l] = pₘₗ
         q′[l] = q[l] + ϵ * M⁻¹[l] * pₘₗ
@@ -956,7 +956,7 @@ function leapfrog(sp::StackPointer,
     # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ)
     ∇ℓq′ = Q′.∇ℓq
     # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
-    @fastmath @inbounds @simd for l ∈ 1:L
+    @fastmath @inbounds @simd ivdep for l ∈ 1:L
         pₘ[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
     end
     sp, PhasePoint(Q′, pₘ)
@@ -1383,7 +1383,7 @@ function combine_turn_statistics(
         free_ρ♯!(tree, x.p♯₊.flag)
         free_ρ♯!(tree, y.p♯₋.flag)
     end
-    @inbounds @simd for l in 1:L
+    @inbounds @simd ivdep for l in 1:L
         ρ[l] = ρₓ[l] + ρʸ[l]
     end
     # x.p♯₊.flag == x.p♯₋.flag || free_ρ♯!(tree, x.p♯₊.flag)
