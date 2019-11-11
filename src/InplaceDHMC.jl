@@ -24,6 +24,7 @@ using Statistics: cov, mean, median, middle, quantile, var
 using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, PaddedMatrices, QuasiNewtonMethods, ProbabilityModels, SIMDPirates
 using QuasiNewtonMethods: AbstractProbabilityModel, dimension, logdensity, logdensity_and_gradient!
 using PaddedMatrices: Static
+using LoopVectorization: @vvectorize_unsafe
 # using ProbabilityModels: 
 # using PaddedMatrices: AbstractFixedSizeMatrix
 
