@@ -786,11 +786,11 @@ Return kinetic energy `κ`, at momentum `p`.
         # @show p
         ke = zero(T)
         # @vvectorize instead of @simd for the masked reduction
-        @vvectorize $T 4 for d ∈ 1:$D
+        @vvectorize_unsafe $T 4 for d ∈ 1:$D # these are PtrVector already; GC preservation must happen elsewhere
             pᵈ = p[d]
             ke += pᵈ * M⁻¹[d] * pᵈ
         end
-        T(0.5) * ke
+        $T(0.5) * ke
     end
 end
 # kinetic_energy(κ::GaussianKineticEnergy, p, q = nothing) = dot(p, κ.M⁻¹ * p) / 2
@@ -1399,7 +1399,7 @@ end
     # @argcheck p♯₋ ≢ p♯₊ "internal error: is_turning called on a leaf"
         d♯₋ = zero($T)
         d♯₊ = zero($T)
-        @vvectorize $T 2 for d in 1:$D
+        @vvectorize_unsafe $T 2 for d in 1:$D
             ρᵈ = ρ[d]
             d♯₋ += ρᵈ * p♯₋[d]
             d♯₊ += ρᵈ * p♯₊[d]
