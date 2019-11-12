@@ -16,10 +16,11 @@ using LinearAlgebra: Diagonal, Symmetric
 # using LogDensityProblems: capabilities, LogDensityOrder, dimension, logdensity_and_gradient
 # import NLSolversBase, Optim # optimization step in mcmc
 using Parameters: @unpack
-# using Random
-# using Statistics: cov, mean, median, middle, quantile, var
+using Random
+using Statistics: cov, mean, median, middle, quantile, var
 
-using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, PaddedMatrices, QuasiNewtonMethods, SIMDPirates
+using VectorizedRNG: AbstractPCG, PtrPCG
+using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, PaddedMatrices, QuasiNewtonMethods, SIMDPirates, Mmap
 using QuasiNewtonMethods: AbstractProbabilityModel, dimension, logdensity, logdensity_and_gradient!
 using LoopVectorization: @vvectorize_unsafe
 
