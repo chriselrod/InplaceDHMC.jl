@@ -45,7 +45,7 @@ include("reporting.jl")
 include("warmup.jl")
 include("mcmc.jl")
 include("rng.jl")
-# include("diagnostics.jl")
+include("diagnostics.jl")
 
 function __init__()
     NTHREADS[] = Threads.nthreads()

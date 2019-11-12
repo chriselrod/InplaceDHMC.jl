@@ -10,12 +10,12 @@ export EBFMI, summarize_tree_statistics, explore_log_acceptance_ratios, leapfrog
 
 using InplaceDHMC: GaussianKineticEnergy, Hamiltonian, evaluate_ℓ, InvalidTree,
     REACHED_MAX_DEPTH, is_divergent, log_acceptance_ratio, PhasePoint, rand_p, leapfrog,
-    logdensity, MAX_DIRECTIONS_DEPTH
+    logdensity, MAX_DIRECTIONS_DEPTH, TreeStatisticsNUTS
 
 # using ArgCheck: @argcheck
 using DocStringExtensions: FIELDS, SIGNATURES, TYPEDEF
-using ProbabilityModels: dimension
 using Parameters: @unpack
+using QuasiNewtonMethods: dimension
 import Random
 using Statistics: mean, quantile, var
 
@@ -25,10 +25,11 @@ Energy Bayesian fraction of missing information. Useful for diagnosing poorly
 chosen kinetic energies.
 Low values (`≤ 0.3`) are considered problematic. See Betancourt (2016).
 """
-function EBFMI(tree_statistics)
+function EBFMI(tree_statistics::AbstractVector{TreeStatisticsNUTS})
     πs = map(x -> x.π, tree_statistics)
     mean(abs2, diff(πs)) / var(πs)
 end
+EBFMI(tree_statistics::AbstractArray{TreeStatisticsNUTS}) = EBFMI(vec(tree_statistics))
 
 "Acceptance quantiles for [`TreeStatisticsSummary`](@ref) diagnostic summary."
 const ACCEPTANCE_QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
@@ -90,13 +91,14 @@ end
 $(SIGNATURES)
 Summarize tree statistics. Mostly useful for NUTS diagnostics.
 """
-function summarize_tree_statistics(tree_statistics)
+function summarize_tree_statistics(tree_statistics::AbstractVector{TreeStatisticsNUTS})
     As = map(x -> x.acceptance_rate, tree_statistics)
     TreeStatisticsSummary(length(tree_statistics),
                           mean(As), quantile(As, ACCEPTANCE_QUANTILES),
                           count_terminations(tree_statistics),
                           count_depths(tree_statistics))
 end
+summarize_tree_statistics(tree_statistics::AbstractArray{TreeStatisticsNUTS}) = summarize_tree_statistics(vec(tree_statistics))
 
 function Base.show(io::IO, stats::TreeStatisticsSummary)
     @unpack N, a_mean, a_quantiles, termination_counts, depth_counts = stats
@@ -138,7 +140,7 @@ function explore_log_acceptance_ratios(ℓ, q, log2ϵs;
                                        κ = GaussianKineticEnergy(dimension(ℓ)),
                                        N = 20, ps = nothing)
     if ps === nothing
-        _ps = [rand_p(rng, κ) for _ in 1:N])
+        _ps = [rand_p(rng, κ) for _ in 1:N]
     else
         _ps = ps
     end
