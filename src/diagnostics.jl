@@ -29,7 +29,7 @@ function EBFMI(tree_statistics::AbstractVector{TreeStatisticsNUTS})
     πs = map(x -> x.π, tree_statistics)
     mean(abs2, diff(πs)) / var(πs)
 end
-EBFMI(tree_statistics::AbstractArray{TreeStatisticsNUTS}) = EBFMI(vec(tree_statistics))
+EBFMI(tree_statistics::AbstractMatrix{TreeStatisticsNUTS}) = [EBFMI(tree_stats) for tree_stats ∈ eachcol(tree_statistics)]
 
 "Acceptance quantiles for [`TreeStatisticsSummary`](@ref) diagnostic summary."
 const ACCEPTANCE_QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
