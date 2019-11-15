@@ -167,8 +167,9 @@ function warmup!(
         isfinite(ℓq) && return WarmupState(PhasePoint(EvaluatedLogDensity(q, ℓq, ∇ℓq), p, flag), κ, ϵ)
         random_position!(rng, q)
         ℓq = evaluate_ℓ!(tree.sptr, ∇ℓq, ℓ, q).ℓq
+        magnitude_penalty += magnitude_penalty
     end
-    ThrowOptimizationError("Optimization failed to converge, returning $ℓq; Thrad ID: $(Threads.threadid()).")
+    ThrowOptimizationError("Optimization failed to converge, returning $ℓq; Thread ID: $(Threads.threadid()).")
     # fg! = function(F, G, q)
         # ℓq, ∇ℓq = logdensity_and_gradient(ℓ, q)
         # if G ≠ nothing
