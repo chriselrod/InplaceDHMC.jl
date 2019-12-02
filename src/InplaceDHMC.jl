@@ -46,6 +46,8 @@ include("warmup.jl")
 include("mcmc.jl")
 include("rng.jl")
 include("diagnostics.jl")
+include("precompile.jl")
+_precompile_()
 
 function __init__()
     NTHREADS[] = Threads.nthreads()

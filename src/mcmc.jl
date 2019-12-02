@@ -92,7 +92,7 @@ $(DOC_INITIAL_WARMUP_ARGS)
 # end
 
 function mcmc_with_warmup!(
-    rng::AbstractRNG, sptr::StackPointer, chain::AbstractMatrix{T}, tree_statistics::AbstractVector{TreeStatisticsNUTS}, ℓ::AbstractProbabilityModel{D}, N = size(chain,2);
+    rng::AbstractRNG, sptr::StackPointer, chain::AbstractMatrix{T}, tree_statistics::AbstractVector{TreeStatisticsNUTS}, ℓ::AbstractProbabilityModel{D}, N::Int = size(chain,2);
     initialization = (), warmup_stages = default_warmup_stages(), algorithm = NUTS(), reporter = default_reporter()
 ) where {D,T}
 
