@@ -64,6 +64,7 @@ function __init__()
         VectorizationBase.align(Base.unsafe_convert(Ptr{Cvoid}, pointer(MMAP[])))
     )
     STACK_POINTER_REF[] = threadrandinit!(STACK_POINTER_REF[], GLOBAL_PCGs)
+    _precompile_()
 end
 function realloc_stack(new_local_stack_size::Integer)
     @warn """You must redefine all probability models. The stack pointers get dereferenced at compile time, and the stack has just been reallocated.
