@@ -22,7 +22,7 @@ using Statistics: cov, mean, median, middle, quantile, var
 using VectorizedRNG: AbstractPCG, PtrPCG
 using VectorizationBase, LoopVectorization, VectorizedRNG, StackPointers, PaddedMatrices, QuasiNewtonMethods, SIMDPirates, Mmap
 using QuasiNewtonMethods: AbstractProbabilityModel, dimension, logdensity, logdensity_and_gradient!
-using LoopVectorization: @vvectorize_unsafe
+using LoopVectorization
 
 # copy from StatsFuns.jl
 function logaddexp(x, y)

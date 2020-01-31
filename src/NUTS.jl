@@ -145,30 +145,28 @@ function combine_turn_statistics(
 end
 
 
-@generated function is_turning(::TrajectoryNUTS, τ::GeneralizedTurnStatistic{D,T,L}) where {D,T,L}
-    quote
+function is_turning(::TrajectoryNUTS, τ::GeneralizedTurnStatistic{D,T,L}) where {D,T,L}
     # Uses the generalized NUTS criterion from Betancourt (2017).
-        @unpack p♯₋, p♯₊, ρ = τ
+    @unpack p♯₋, p♯₊, ρ = τ
     # @argcheck p♯₋ ≢ p♯₊ "internal error: is_turning called on a leaf"
-        d♯₋ = zero($T)
-        d♯₊ = zero($T)
-        @vvectorize_unsafe $T 2 for d in 1:$D
-            ρᵈ = ρ[d]
-            d♯₋ += ρᵈ * p♯₋[d]
-            d♯₊ += ρᵈ * p♯₊[d]
-        end
-        # Current version always calculates both dot products; alternative:
-        # dot(p♯₋, ρ) < 0 || dot(p♯₊, ρ) < 0
-        # Calculating both in one loop is faster
-        # ( 2D fma + 3D loads vs 2D fma + 4D loads; at most 2/4 ops/cycle
-        #   can be loads, so the loads cannot keep up with the 2/4 fma/cycle
-        #   and are the bottleneck ),
-        # but it disallows conditional checking to skip second dot product.
-        #
-        # Which is faster on average depends on probability of turning
-        # probability of turning will be fairly low for most models.
-        (d♯₋ < zero($T)) | (d♯₊ < zero($T))
+    d♯₋ = zero(T)
+    d♯₊ = zero(T)
+    @avx for d ∈ eachindex(ρ)
+        ρᵈ = ρ[d]
+        d♯₋ += ρᵈ * p♯₋[d]
+        d♯₊ += ρᵈ * p♯₊[d]
     end
+    # Current version always calculates both dot products; alternative:
+    # dot(p♯₋, ρ) < 0 || dot(p♯₊, ρ) < 0
+    # Calculating both in one loop is faster
+    # ( 2D fma + 3D loads vs 2D fma + 4D loads; at most 2/4 ops/cycle
+    #   can be loads, so the loads cannot keep up with the 2/4 fma/cycle
+    #   and are the bottleneck ),
+    # but it disallows conditional checking to skip second dot product.
+    #
+    # Which is faster on average depends on probability of turning
+    # probability of turning will be fairly low for most models.
+    (d♯₋ < zero(T)) | (d♯₊ < zero(T))
 end
 
 ###

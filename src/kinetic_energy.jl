@@ -11,19 +11,16 @@
 $(SIGNATURES)
 Return kinetic energy `κ`, at momentum `p`.
 """
-@generated function kinetic_energy(κ::GaussianKineticEnergy{D,T,L}, p::PtrVector{D,T,L}, q = nothing) where {D,T,L}
-    quote
-        M⁻¹ = κ.M⁻¹.diag
-        # @show M⁻¹
-        # @show p
-        ke = zero(T)
-        # @vvectorize instead of @simd ivdep for the masked reduction
-        @vvectorize_unsafe $T 4 for d ∈ 1:$D # these are PtrVector already; GC preservation must happen elsewhere
-            pᵈ = p[d]
-            ke += pᵈ * M⁻¹[d] * pᵈ
-        end
-        $T(0.5) * ke
+function kinetic_energy(κ::GaussianKineticEnergy{D,T,L}, p::PtrVector{D,T,L}, q = nothing) where {D,T,L}
+    M⁻¹ = κ.M⁻¹.diag
+    # @show M⁻¹
+    # @show p
+    ke = zero(T)
+    @avx for d ∈ eachindex(p)
+        pᵈ = p[d]
+        ke += pᵈ * M⁻¹[d] * pᵈ
     end
+    T(0.5) * ke
 end
 # kinetic_energy(κ::GaussianKineticEnergy, p, q = nothing) = dot(p, κ.M⁻¹ * p) / 2
 
@@ -34,6 +31,7 @@ Return ``p♯ = M⁻¹⋅p``, used for turn diagnostics.
 function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹
     sptr, M⁻¹p = PtrVector{P,T,L}(sptr)
+    # @avx for l ∈ eachindex(p)
     @inbounds @simd ivdep for l ∈ 1:L
         M⁻¹p[l] = M⁻¹[l] * p[l]
     end
