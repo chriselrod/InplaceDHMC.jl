@@ -17,7 +17,6 @@ SIMDPirates = "21efa798-c60a-11e8-04d3-e1a92915a26a"
 SLEEFPirates = "476501e8-09a2-5ece-8869-fb82de89a1fa"
 StackPointers = "062a3e2c-34b1-4659-9cae-7af421e0d832"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-StructuredMatrices = "831e5bd0-d036-11e8-2dea-c77e7dab29a6"
 VectorizationBase = "3d5dd08c-fd9d-11e8-17fa-ed2836048c2f"
 VectorizedRNG = "33b4df10-0173-11e9-2a0c-851a7edac40e"
 
