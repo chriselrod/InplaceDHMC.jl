@@ -168,17 +168,17 @@ end
 
 Base.IteratorSize(::Type{<:LeapfrogTrajectory}) = Base.SizeUnknown()
 
-function Base.iterate(lft::LeapfrogTrajectory, zi = (lft.z₀, 0))
-    @unpack H, ϵ, π₀ = lft
-    z, i = zi
-    if isfinite(z.Q.ℓq)
-        z′ = leapfrog(H, z, ϵ)
-        i′ = i + sign(ϵ)
-        _position_information(lft, z′, i′), (z′, i′)
-    else
-        nothing
-    end
-end
+# function Base.iterate(lft::LeapfrogTrajectory, zi = (lft.z₀, 0))
+#     @unpack H, ϵ, π₀ = lft
+#     z, i = zi
+#     if isfinite(z.Q.ℓq)
+#         z′ = leapfrog(H, z, ϵ)
+#         i′ = i + sign(ϵ)
+#         _position_information(lft, z′, i′), (z′, i′)
+#     else
+#         nothing
+#     end
+# end
 
 """
 $(SIGNATURES)

@@ -50,7 +50,7 @@ Gaussian kinetic energy with the given inverse covariance matrix `M⁻¹`.
 function GaussianKineticEnergy(sptr::StackPointer, M⁻¹::Diagonal{T,PtrVector{P,T,L,false}}) where {P,T,L}
     sptr, W = PtrVector{P,T,L}(sptr)
     M⁻¹d = M⁻¹.diag
-    @fastmath @inbounds @simd ivdep for l ∈ 1:L
+    @avx for l ∈ eachindex(W)
         W[l] = one(T) / sqrt( M⁻¹d[l] )
     end
     sptr, GaussianKineticEnergy(M⁻¹, Diagonal( W ))
@@ -64,7 +64,7 @@ function GaussianKineticEnergy(sptr::StackPointer, ::Static{D}, m⁻¹::T = 1.0)
     sptr, M⁻¹ = PtrVector{D,T}(sptr)
     sptr, W   = PtrVector{D,T}(sptr)
     @fastmath mroot = 1 / sqrt(m⁻¹)
-    @inbounds for d in 1:PaddedMatrices.full_length(W)
+    @avx for d in eachindex(W)
         M⁻¹[d] = m⁻¹
         W[d] = mroot
     end

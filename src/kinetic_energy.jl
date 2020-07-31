@@ -30,9 +30,8 @@ Return ``p♯ = M⁻¹⋅p``, used for turn diagnostics.
 """
 function calculate_p♯(sptr::StackPointer, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹
-    sptr, M⁻¹p = PtrVector{P,T,L}(sptr)
-    # @avx for l ∈ eachindex(p)
-    @inbounds @simd ivdep for l ∈ 1:L
+    sptr, M⁻¹p = PtrVector{P,T}(sptr)
+    @avx for l ∈ eachindex(M⁻¹p)
         M⁻¹p[l] = M⁻¹[l] * p[l]
     end
     sptr, M⁻¹p
@@ -40,7 +39,7 @@ end
 function calculate_p♯(tree::Tree{P,T,L}, κ::GaussianKineticEnergy, p::PtrVector{P,T,L}, q = nothing) where {P,T,L}
     M⁻¹ = κ.M⁻¹.diag
     M⁻¹p = undefined_ρ♯( tree )
-    @inbounds @simd ivdep for l ∈ 1:L
+    @avx for l ∈ eachindex(M⁻¹p)
         M⁻¹p[l] = M⁻¹[l] * p[l]
     end
     M⁻¹p
@@ -138,12 +137,13 @@ function leapfrog(tree::Tree{P,T,L},
     LT = L*sizeof(T) # counting on this being aligned.
     pₘ = PtrVector{P,T,L}(treeptr) 
     q′ = PtrVector{P,T,L}(treeptr + LT)
+    
     # @show ϵ
     # @show z
     # @show bitstring(z.flag)
     M⁻¹ = κ.M⁻¹.diag
     ϵₕ = T(0.5) * ϵ
-    @fastmath @inbounds @simd ivdep for l ∈ 1:L
+    @avx for l ∈ eachindex(q)
         pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
         pₘ[l] = pₘₗ
         q′[l] = q[l] + ϵ * M⁻¹[l] * pₘₗ
@@ -156,26 +156,28 @@ function leapfrog(tree::Tree{P,T,L},
     # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ, flag)
     # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
     ∇ℓq′ = Q′.∇ℓq
-    @fastmath @inbounds @simd ivdep for l ∈ 1:L
-        pₘ[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
+    @avx for l ∈ eachindex(pₘ)
+        pₘ[l] += ϵₕ * ∇ℓq′[l]
     end
     PhasePoint(Q′, pₘ, flag)
 end
-function leapfrog(sp::StackPointer,
-        H::Hamiltonian{P,T,L},
-        z::PhasePoint{P,T,L}, ϵ::T
+function leapfrog(
+    sp::StackPointer,
+    H::Hamiltonian{P,T,L},
+    z::PhasePoint{P,T,L}, ϵ::T
 ) where {P,L,T}
     @unpack ℓ, κ = H
     @unpack p, Q = z
     @unpack q, ∇ℓq = Q
-#    @argcheck isfinite(Q.ℓq) "Internal error: leapfrog called from non-finite log density"
+    
     sptr = pointer(sp, T)
     LT = L*sizeof(T) # counting on this being aligned.
     pₘ = PtrVector{P,T,L}(sptr) 
     q′ = PtrVector{P,T,L}(sptr + LT)
+
     M⁻¹ = κ.M⁻¹.diag
     ϵₕ = T(0.5) * ϵ
-    @fastmath @inbounds @simd ivdep for l ∈ 1:L
+    @avx for l ∈ eachindex(p)
         pₘₗ = p[l] + ϵₕ * ∇ℓq[l]
         pₘ[l] = pₘₗ
         q′[l] = q[l] + ϵ * M⁻¹[l] * pₘₗ
@@ -186,8 +188,8 @@ function leapfrog(sp::StackPointer,
     # isfinite(Q′.ℓq) || return PhasePoint(Q′, pₘ)
     ∇ℓq′ = Q′.∇ℓq
     # p′ = pₘ # PtrVector{P,T,L}(sptr + 3LT)
-    @fastmath @inbounds @simd ivdep for l ∈ 1:L
-        pₘ[l] = pₘ[l] + ϵₕ * ∇ℓq′[l]
+    @avx for l ∈ eachindex(pₘ)
+        pₘ[l] += ϵₕ * ∇ℓq′[l]
     end
     sp, PhasePoint(Q′, pₘ)
 end

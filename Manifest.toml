@@ -19,9 +19,9 @@ uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 
 [[DocStringExtensions]]
 deps = ["LibGit2", "Markdown", "Pkg", "Test"]
-git-tree-sha1 = "88bb0edb352b16608036faadcc071adda068582a"
+git-tree-sha1 = "c5714d9bcdba66389612dc4c47ed827c64112997"
 uuid = "ffbed154-4ef7-542d-bbb7-c09d3a79fcae"
-version = "0.8.1"
+version = "0.8.2"
 
 [[InteractiveUtils]]
 deps = ["Markdown"]
@@ -42,12 +42,10 @@ uuid = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 
 [[LoopVectorization]]
-deps = ["LinearAlgebra", "Parameters", "SIMDPirates", "SLEEFPirates", "VectorizationBase"]
-git-tree-sha1 = "90596a89329e581fad12f03778e60dc63dfa6096"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/LoopVectorization.jl"
+deps = ["DocStringExtensions", "LinearAlgebra", "OffsetArrays", "SIMDPirates", "SLEEFPirates", "UnPack", "VectorizationBase"]
+git-tree-sha1 = "25b1363081880dcd6a9e27736f4b1951ea4b8933"
 uuid = "bdcacae8-1622-11e9-2a5c-532679323890"
-version = "0.6.12"
+version = "0.8.20"
 
 [[Markdown]]
 deps = ["Base64"]
@@ -57,35 +55,15 @@ uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
 uuid = "a63ad114-7e13-5084-954f-fe012c677804"
 
 [[OffsetArrays]]
-git-tree-sha1 = "707e34562700b81e8aa13548eb6b23b18112e49b"
+git-tree-sha1 = "2066e16af994955287f2e03ba1d9e890eb43b0dd"
 uuid = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
-version = "1.0.2"
-
-[[OpenSpecFun_jll]]
-deps = ["Libdl", "Pkg"]
-git-tree-sha1 = "65f672edebf3f4e613ddf37db9dcbd7a407e5e90"
-uuid = "efe28fd5-8261-553b-a9e1-b2916fc3738e"
-version = "0.5.3+1"
-
-[[OrderedCollections]]
-deps = ["Random", "Serialization", "Test"]
-git-tree-sha1 = "c4c13474d23c60d20a67b217f1d7f22a40edf8f1"
-uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
-version = "1.1.0"
+version = "1.1.2"
 
 [[PaddedMatrices]]
-deps = ["LinearAlgebra", "LoopVectorization", "Parameters", "Random", "ReverseDiffExpressionsBase", "SIMDPirates", "SLEEFPirates", "SpecialFunctions", "StackPointers", "VectorizationBase", "VectorizedRNG"]
-git-tree-sha1 = "dde494dbee039b8fe8a70e56f1ed54284c1a41a1"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/PaddedMatrices.jl"
+deps = ["LinearAlgebra", "LoopVectorization", "Random", "SIMDPirates", "SLEEFPirates", "StackPointers", "VectorizationBase", "VectorizedRNG"]
+git-tree-sha1 = "745d054834b80ac86d9c445702684a816ff9b1db"
 uuid = "aaaacae8-1622-11e9-2a5c-532679323890"
-version = "0.1.0"
-
-[[Parameters]]
-deps = ["OrderedCollections"]
-git-tree-sha1 = "b62b2558efb1eef1fa44e4be5ff58a515c287e38"
-uuid = "d96e819e-fc66-5662-9728-84c9c7592b0a"
-version = "0.12.0"
+version = "0.1.10"
 
 [[Pkg]]
 deps = ["Dates", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "REPL", "Random", "SHA", "UUIDs"]
@@ -96,47 +74,33 @@ deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 
 [[QuasiNewtonMethods]]
-deps = ["LinearAlgebra", "LoopVectorization", "PaddedMatrices", "Parameters", "ReverseDiffExpressionsBase", "SIMDPirates", "SLEEFPirates", "StackPointers", "VectorizationBase", "VectorizedRNG"]
-git-tree-sha1 = "c37c4e298f102e4039566ee1d67f09e65cbe6a6e"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/QuasiNewtonMethods.jl"
+deps = ["LoopVectorization", "PaddedMatrices"]
+git-tree-sha1 = "077f8da7899092c61129bcbc23770cf4e2f28488"
 uuid = "64452400-c6f4-4a1d-a4f6-ad403655768a"
 version = "0.1.0"
 
 [[REPL]]
-deps = ["InteractiveUtils", "Markdown", "Sockets"]
+deps = ["InteractiveUtils", "Markdown", "Sockets", "Unicode"]
 uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 
 [[Random]]
 deps = ["Serialization"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
-[[ReverseDiffExpressionsBase]]
-deps = ["LinearAlgebra", "LoopVectorization", "OffsetArrays"]
-git-tree-sha1 = "a5deb3c264b753075b64316e065e12667104cc81"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/ReverseDiffExpressionsBase.jl"
-uuid = "6c4e8705-acc8-45e6-99c7-2e34d4f10b96"
-version = "0.1.0"
-
 [[SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 
 [[SIMDPirates]]
 deps = ["VectorizationBase"]
-git-tree-sha1 = "135a324cabe088eda2f10c1825fcfe291d148178"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/SIMDPirates.jl"
+git-tree-sha1 = "19880eef12759d7d049516fcb11f1ed8440963d6"
 uuid = "21efa798-c60a-11e8-04d3-e1a92915a26a"
-version = "0.3.12"
+version = "0.8.21"
 
 [[SLEEFPirates]]
 deps = ["Libdl", "SIMDPirates", "VectorizationBase"]
-git-tree-sha1 = "140173ca7bf7a5c8cd236aa80f828ea8477e2323"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/SLEEFPirates.jl"
+git-tree-sha1 = "67ae90a18aa8c22bf159318300e765fbd89ddf6e"
 uuid = "476501e8-09a2-5ece-8869-fb82de89a1fa"
-version = "0.3.5"
+version = "0.5.5"
 
 [[Serialization]]
 uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
@@ -148,19 +112,11 @@ uuid = "6462fe0b-24de-5631-8697-dd941f90decc"
 deps = ["LinearAlgebra", "Random"]
 uuid = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
-[[SpecialFunctions]]
-deps = ["OpenSpecFun_jll"]
-git-tree-sha1 = "e19b98acb182567bcb7b75bb5d9eedf3a3b5ec6c"
-uuid = "276daf66-3868-5448-9aa4-cd146d93841b"
-version = "0.10.0"
-
 [[StackPointers]]
 deps = ["VectorizationBase"]
-git-tree-sha1 = "23a20443336b42aef9c867f2f659f1d67f3734fa"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/StackPointers.jl"
+git-tree-sha1 = "3a4da81e25be1cedcc14576b696e2da6c9bb989b"
 uuid = "062a3e2c-34b1-4659-9cae-7af421e0d832"
-version = "0.1.1"
+version = "0.1.2"
 
 [[Statistics]]
 deps = ["LinearAlgebra", "SparseArrays"]
@@ -174,21 +130,22 @@ uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 deps = ["Random", "SHA"]
 uuid = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
+[[UnPack]]
+git-tree-sha1 = "d4bfa022cd30df012700cf380af2141961bb3bfb"
+uuid = "3a884ed6-31ef-47d7-9d2a-63182c4928ed"
+version = "1.0.1"
+
 [[Unicode]]
 uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 
 [[VectorizationBase]]
-deps = ["CpuId", "LinearAlgebra"]
-git-tree-sha1 = "cd08ddb0402d04aa359da31a49b9a64bc8e2973c"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/VectorizationBase.jl"
+deps = ["CpuId", "Libdl", "LinearAlgebra"]
+git-tree-sha1 = "46afc4dc02f534e149149173f38f8f59cc23c165"
 uuid = "3d5dd08c-fd9d-11e8-17fa-ed2836048c2f"
-version = "0.3.0"
+version = "0.12.29"
 
 [[VectorizedRNG]]
 deps = ["Distributed", "Random", "SIMDPirates", "VectorizationBase"]
-git-tree-sha1 = "f8c0063f97f2a617c56a115d4dab258c967f2395"
-repo-rev = "master"
-repo-url = "https://github.com/chriselrod/VectorizedRNG.jl"
+git-tree-sha1 = "e3407eb43119ecd7a1755ef39ab47fde767b9858"
 uuid = "33b4df10-0173-11e9-2a0c-851a7edac40e"
-version = "0.1.1"
+version = "0.1.10"

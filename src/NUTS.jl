@@ -136,7 +136,7 @@ function combine_turn_statistics(
         free_ρ♯!(tree, x.p♯₊.flag)
         free_ρ♯!(tree, y.p♯₋.flag)
     end
-    @inbounds @simd ivdep for l in 1:L
+    @avx for l in eachindex(ρ)
         ρ[l] = ρₓ[l] + ρʸ[l]
     end
     # x.p♯₊.flag == x.p♯₋.flag || free_ρ♯!(tree, x.p♯₊.flag)

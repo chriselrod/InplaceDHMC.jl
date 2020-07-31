@@ -24,11 +24,11 @@ aligned_offset(::Tree{D,T,L}) where {D,T,L} = L*sizeof(T)
     # flag::UInt32
 # end
 struct FlaggedVector{D,T,L} <: PaddedMatrices.AbstractMutableFixedSizeVector{D,T,L}
-    v::PtrVector{D,T,L,false}
+    v::PtrVector{D,T,1,0,0,false}
     flag::UInt32
 end
 @inline function FlaggedVector{D,T,L}(ptr::Ptr{T}, flag::UInt32) where {D,T,L}
-    FlaggedVector{D,T,L}(PtrVector{D,T,L,false}(ptr), flag)
+    FlaggedVector{D,T,L}(PtrVector{D,T,1,0,0,false}(ptr), flag)
 end
 @inline Base.pointer(v::FlaggedVector) = v.v.ptr
 
@@ -36,8 +36,9 @@ function Tree{D,T,L}(sptr::StackPointer, depth::Int = DEFAULT_MAX_TREE_DEPTH) wh
     root = pointer(sptr, T)
     depth₊ = depth + 3
     # set roots to zero so that all loads can properly be interpreted as bools without further processing on future accesses.
-    SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, root), (VE(0xffffffff),VE(0xffffffff),VE(0xffffffff),VE(0xffffffff)))
-    Tree{D,T,L}( root, depth₊, sptr + VectorizationBase.REGISTER_SIZE + 6L*sizeof(T)*depth₊ )
+    tree = Tree{D,T,L}( root, depth₊, sptr + VectorizationBase.REGISTER_SIZE + 6L*sizeof(T)*depth₊ )
+    clear!(tree)
+    tree
 end
 clear!(tree::Tree) = SIMDPirates.vstore!(reinterpret(Ptr{UInt64}, tree.root), (VE(0xffffffffffffffff),VE(0xffffffffffffffff)))
 clear_all_but_z!(tree::Tree, flag::UInt32) = SIMDPirates.vstore!(reinterpret(Ptr{UInt32}, tree.root), (VE(0xffffffff ⊻ flag),VE(0xffffffff),VE(0xffffffff),VE(0xffffffff)))
