@@ -9,7 +9,6 @@ makedocs(;
     repo="https://github.com/chriselrod/InplaceDHMC.jl/blob/{commit}{path}#L{line}",
     sitename="InplaceDHMC.jl",
     authors="Chris Elrod <elrodc@gmail.com>",
-    assets=String[],
 )
 
 deploydocs(;
